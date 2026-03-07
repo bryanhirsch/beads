@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`bd reset`** — wraps `git reset` with immediate Dolt mismatch detection; recommended interface for time-travel (`bd reset --hard HEAD~1`)
+- **`branch_strategy.*` config** — off by default; uncomment `branch_strategy` section in `config.yaml` to enable ref generation and `bd reset` functionality
+
 ## [0.59.0] - 2026-03-05
 
 ### Added

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,8 +13,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // managedHookNames lists the git hooks managed by beads.
@@ -813,7 +817,99 @@ func runPostCheckoutHook(args []string) int {
 	if exitCode := runChainedHook("post-checkout", args); exitCode != 0 {
 		return exitCode
 	}
+
+	// Only run beads ref sync for branch-level checkouts (flag=1).
+	// flag=0 means file-level checkout — skip entirely.
+	if len(args) < 3 || args[2] != "1" {
+		return 0
+	}
+
+	// Skip during rebase — intermediate checkouts shouldn't trigger sync
+	if isRebaseInProgress() {
+		return 0
+	}
+
 	return 0
+}
+
+// maybePromptBranchStrategy checks if the current Dolt branch is unregistered
+// and prompts the user to select a merge strategy (A/B/C).
+// Respects branch_strategy.prompt and branch_strategy.default_strategy config.
+func maybePromptBranchStrategy(ctx context.Context, s *dolt.DoltStore) {
+	branch, err := s.CurrentBranch(ctx)
+	if err != nil || branch == "main" {
+		return
+	}
+
+	// Check if already registered
+	info, err := s.GetBranchInfo(ctx, branch)
+	if err != nil || info != nil {
+		return // already registered or error
+	}
+
+	// Read default strategy from config.yaml (fallback: stay-on-main)
+	defaultStrategy := "stay-on-main"
+	if cfgVal := config.GetString("branch_strategy.default_strategy"); cfgVal != "" {
+		if _, ok := validStrategies[strings.ToLower(cfgVal)]; ok {
+			defaultStrategy = cfgVal
+		}
+	}
+
+	// Check if prompting is enabled
+	promptEnabled := config.GetBool("branch_strategy.prompt")
+	if !promptEnabled {
+		// Silent: register with default strategy
+		if err := s.RegisterBranch(ctx, branch, defaultStrategy); err != nil {
+			debug.Logf("beads: failed to register branch %s: %v", branch, err)
+		}
+		return
+	}
+
+	// Interactive prompt — need a TTY
+	if !isTerminal() {
+		// Non-TTY: register with default strategy silently
+		if err := s.RegisterBranch(ctx, branch, defaultStrategy); err != nil {
+			debug.Logf("beads: failed to register branch %s: %v", branch, err)
+		}
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "\nbeads: Dolt branch %q is not registered.\n", branch)
+	fmt.Fprintf(os.Stderr, "  Select a merge strategy:\n")
+	fmt.Fprintf(os.Stderr, "    [A] stay-on-main     — DB writes go directly to Dolt main (default)\n")
+	fmt.Fprintf(os.Stderr, "    [B] merge-with-branch — DB stays on Dolt branch, merges when code merges\n")
+	fmt.Fprintf(os.Stderr, "    [C] merge-on-close   — DB stays on Dolt branch, merges on bd close\n")
+	fmt.Fprintf(os.Stderr, "\nStrategy [A/b/c]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return // EOF — skip registration
+	}
+	choice := strings.TrimSpace(strings.ToLower(line))
+
+	strategy := defaultStrategy
+	if slug, ok := validStrategies[choice]; ok {
+		strategy = slug
+	} else if choice != "" {
+		fmt.Fprintf(os.Stderr, "beads: invalid choice %q, using %s\n", choice, defaultStrategy)
+	}
+
+	if err := s.RegisterBranch(ctx, branch, strategy); err != nil {
+		fmt.Fprintf(os.Stderr, "beads: warning: failed to register branch %s: %v\n", branch, err)
+	} else {
+		fmt.Fprintf(os.Stderr, "beads: registered branch %s with strategy %s\n", branch, strategy)
+	}
+}
+
+// isTerminal returns true if stderr is connected to a terminal.
+// Used to decide whether interactive prompts are appropriate.
+func isTerminal() bool {
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // runPrepareCommitMsgHook adds agent identity trailers to commit messages.
