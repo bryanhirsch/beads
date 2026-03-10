@@ -18,6 +18,8 @@ func transact(ctx context.Context, s storage.DoltStorage, commitMsg string, fn f
 	err := s.RunInTransaction(ctx, commitMsg, fn)
 	if err == nil {
 		commandDidExplicitDoltCommit = true
+		// Write .beads/HEAD and refs after successful transaction commit
+		writeBeadsRefs(ctx, s)
 	}
 	return err
 }
@@ -69,6 +71,10 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 		}
 		return err
 	}
+
+	// Write .beads/HEAD and refs after successful commit
+	writeBeadsRefs(ctx, st)
+
 	return nil
 }
 
