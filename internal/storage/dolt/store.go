@@ -1860,6 +1860,16 @@ func (s *DoltStore) CurrentBranch(ctx context.Context) (string, error) {
 	return branch, nil
 }
 
+// ResetToCommit performs a hard reset of the current branch to the given commit hash.
+// Used by the post-checkout hook to sync Dolt state with a previously recorded BEADS_HEAD.
+func (s *DoltStore) ResetToCommit(ctx context.Context, commitHash string) error {
+	_, err := s.db.ExecContext(ctx, "CALL DOLT_RESET('--hard', ?)", commitHash)
+	if err != nil {
+		return fmt.Errorf("failed to reset to commit %s: %w", commitHash, err)
+	}
+	return nil
+}
+
 // DeleteBranch deletes a branch (used to clean up import branches)
 func (s *DoltStore) DeleteBranch(ctx context.Context, branch string) error {
 	_, err := s.db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", branch)
