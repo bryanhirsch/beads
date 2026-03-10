@@ -81,7 +81,7 @@ func cherryPickToTarget(ctx context.Context, db *sql.DB, s *dolt.DoltStore, targ
 		// Check for conflicts — don't leave dirty state
 		if strings.Contains(err.Error(), "conflict") {
 			// Abort the cherry-pick to clean up
-			_, _ = db.ExecContext(ctx, "CALL DOLT_MERGE('--abort')")
+			_, _ = db.ExecContext(ctx, "CALL DOLT_CHERRY_PICK('--abort')")
 		}
 		return fmt.Errorf("cherry-pick %s onto %s: %w", commitHash[:8], targetBranch, err)
 	}
