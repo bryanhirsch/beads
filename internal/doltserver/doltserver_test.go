@@ -8,41 +8,47 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/configfile"
 )
 
-func TestDerivePort(t *testing.T) {
-	// Deterministic: same path gives same port
-	port1 := DerivePort("/home/user/project/.beads")
-	port2 := DerivePort("/home/user/project/.beads")
-	if port1 != port2 {
-		t.Errorf("same path gave different ports: %d vs %d", port1, port2)
+func TestAllocateEphemeralPort(t *testing.T) {
+	// Should return a valid port in the ephemeral range
+	port, err := allocateEphemeralPort("127.0.0.1")
+	if err != nil {
+		t.Fatalf("allocateEphemeralPort: %v", err)
+	}
+	if port < 1024 || 65535 < port {
+		t.Errorf("port %d outside valid range [1024, 65535]", port)
 	}
 
-	// Different paths give different ports (with high probability)
-	port3 := DerivePort("/home/user/other-project/.beads")
-	if port1 == port3 {
-		t.Logf("warning: different paths gave same port (possible but unlikely): %d", port1)
+	// Multiple calls should return different ports (with very high probability)
+	port2, err := allocateEphemeralPort("127.0.0.1")
+	if err != nil {
+		t.Fatalf("allocateEphemeralPort (2nd call): %v", err)
+	}
+	if port == port2 {
+		t.Logf("warning: two consecutive allocations returned the same port %d (unlikely)", port)
+	}
+
+	// The returned port should be available for binding
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port2)))
+	if err != nil {
+		t.Logf("warning: allocated port %d not immediately bindable (TOCTOU): %v", port2, err)
+	} else {
+		_ = ln.Close()
 	}
 }
 
-func TestDerivePortRange(t *testing.T) {
-	// Test many paths to verify range
-	paths := []string{
-		"/a", "/b", "/c", "/tmp/foo", "/home/user/project",
-		"/var/data/repo", "/opt/work/beads", "/Users/test/.beads",
-		"/very/long/path/to/a/project/directory/.beads",
-		"/another/unique/path",
+func TestAllocateEphemeralPortIPv6(t *testing.T) {
+	// Should work with IPv6 loopback if available
+	port, err := allocateEphemeralPort("::1")
+	if err != nil {
+		t.Skipf("IPv6 loopback not available: %v", err)
 	}
-
-	for _, p := range paths {
-		port := DerivePort(p)
-		if port < portRangeBase || port >= portRangeBase+portRangeSize {
-			t.Errorf("DerivePort(%q) = %d, outside range [%d, %d)",
-				p, port, portRangeBase, portRangeBase+portRangeSize)
-		}
+	if port < 1024 || 65535 < port {
+		t.Errorf("port %d outside valid range [1024, 65535]", port)
 	}
 }
 
@@ -179,24 +185,22 @@ func TestIsRunningCorruptPID(t *testing.T) {
 }
 
 func TestDefaultConfig(t *testing.T) {
-	dir := t.TempDir()
-
-	t.Run("standalone", func(t *testing.T) {
-		// Clear both env vars to test pure standalone behavior
+	t.Run("standalone_returns_zero_port", func(t *testing.T) {
+		// Clear env vars to test pure standalone behavior
 		t.Setenv("GT_ROOT", "")
 		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 
-		cfg := DefaultConfig(dir)
+		freshDir := t.TempDir()
+		cfg := DefaultConfig(freshDir)
 		if cfg.Host != "127.0.0.1" {
 			t.Errorf("expected host 127.0.0.1, got %s", cfg.Host)
 		}
-		// Standalone mode defaults to DerivePort (hash-based, per-project)
-		expected := DerivePort(dir)
-		if cfg.Port != expected {
-			t.Errorf("expected DerivePort %d, got %d", expected, cfg.Port)
+		// No configured port source → port 0 (ephemeral allocation on Start)
+		if cfg.Port != 0 {
+			t.Errorf("expected port 0 (ephemeral) when no port source configured, got %d", cfg.Port)
 		}
-		if cfg.BeadsDir != dir {
-			t.Errorf("expected BeadsDir=%s, got %s", dir, cfg.BeadsDir)
+		if cfg.BeadsDir != freshDir {
+			t.Errorf("expected BeadsDir=%s, got %s", freshDir, cfg.BeadsDir)
 		}
 	})
 
@@ -227,26 +231,23 @@ func TestDefaultConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("no_config_uses_derive_port", func(t *testing.T) {
-		// When no env var, no metadata port, no port file, and no GT_ROOT,
-		// DefaultConfig should use DerivePort for per-project isolation.
+	t.Run("no_config_returns_zero_port", func(t *testing.T) {
+		// When no env var, no metadata port, no port file, and no config.yaml,
+		// DefaultConfig should return port 0 (ephemeral allocation on Start).
 		t.Setenv("GT_ROOT", "")
 		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 
 		freshDir := t.TempDir()
 		cfg := DefaultConfig(freshDir)
 
-		expected := DerivePort(freshDir)
-		if cfg.Port != expected {
-			t.Errorf("expected DefaultConfig to use DerivePort (%d), got %d",
-				expected, cfg.Port)
+		if cfg.Port != 0 {
+			t.Errorf("expected port 0 (ephemeral) when no port source, got %d", cfg.Port)
 		}
 	})
 
-	t.Run("port_file_takes_precedence_over_derive", func(t *testing.T) {
+	t.Run("port_file_takes_precedence_over_ephemeral", func(t *testing.T) {
 		// When a port file exists (written by Start()), DefaultConfig should
-		// use it — this is how commands find a server that Start() placed on
-		// a fallback port.
+		// use it.
 		t.Setenv("GT_ROOT", "")
 		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 
@@ -260,6 +261,44 @@ func TestDefaultConfig(t *testing.T) {
 			t.Errorf("expected port file port 14000, got %d", cfg.Port)
 		}
 	})
+}
+
+func TestEnsurePortFile(t *testing.T) {
+	beadsDir := t.TempDir()
+	portFile := filepath.Join(beadsDir, "dolt-server.port")
+
+	if err := EnsurePortFile(beadsDir, 14567); err != nil {
+		t.Fatalf("EnsurePortFile(write missing): %v", err)
+	}
+	if data, err := os.ReadFile(portFile); err != nil {
+		t.Fatalf("ReadFile(missing): %v", err)
+	} else if got := strings.TrimSpace(string(data)); got != "14567" {
+		t.Fatalf("port file = %q, want 14567", got)
+	}
+
+	if err := os.WriteFile(portFile, []byte("bad"), 0600); err != nil {
+		t.Fatalf("WriteFile(corrupt): %v", err)
+	}
+	if err := EnsurePortFile(beadsDir, 14568); err != nil {
+		t.Fatalf("EnsurePortFile(repair corrupt): %v", err)
+	}
+	if data, err := os.ReadFile(portFile); err != nil {
+		t.Fatalf("ReadFile(repaired): %v", err)
+	} else if got := strings.TrimSpace(string(data)); got != "14568" {
+		t.Fatalf("repaired port file = %q, want 14568", got)
+	}
+
+	if err := os.WriteFile(portFile, []byte("14569"), 0600); err != nil {
+		t.Fatalf("WriteFile(stale): %v", err)
+	}
+	if err := EnsurePortFile(beadsDir, 14570); err != nil {
+		t.Fatalf("EnsurePortFile(update stale): %v", err)
+	}
+	if data, err := os.ReadFile(portFile); err != nil {
+		t.Fatalf("ReadFile(updated): %v", err)
+	} else if got := strings.TrimSpace(string(data)); got != "14570" {
+		t.Fatalf("updated port file = %q, want 14570", got)
+	}
 }
 
 func TestStopNotRunning(t *testing.T) {
@@ -443,24 +482,32 @@ func TestIsRunningReadsPortFile(t *testing.T) {
 	}
 }
 
-// --- Activity tracking tests ---
+// --- IsRunning port-zero orphan recovery ---
 
-func TestTouchAndReadActivity(t *testing.T) {
+func TestIsRunningOrphanNoPortFile(t *testing.T) {
+	// When PID file exists but process is dead and no port file,
+	// IsRunning should clean up and return Running=false.
+	// (The orphan kill path for *live* processes requires a real dolt server,
+	// but the dead-PID cleanup path exercises the same code structure.)
 	dir := t.TempDir()
+	t.Setenv("GT_ROOT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 
-	// No file yet
-	if ts := ReadActivityTime(dir); !ts.IsZero() {
-		t.Errorf("expected zero time for missing activity file, got %v", ts)
+	// Write PID file with dead PID, no port file
+	if err := os.WriteFile(pidPath(dir), []byte("99999999"), 0600); err != nil {
+		t.Fatal(err)
 	}
 
-	// Touch and read
-	touchActivity(dir)
-	ts := ReadActivityTime(dir)
-	if ts.IsZero() {
-		t.Fatal("expected non-zero activity time after touch")
+	state, err := IsRunning(dir)
+	if err != nil {
+		t.Fatalf("IsRunning error: %v", err)
 	}
-	if time.Since(ts) > 5*time.Second {
-		t.Errorf("activity timestamp too old: %v", ts)
+	if state.Running {
+		t.Error("expected Running=false for dead PID with no port file")
+	}
+	// PID file should be cleaned up
+	if _, err := os.Stat(pidPath(dir)); !os.IsNotExist(err) {
+		t.Error("expected PID file to be removed")
 	}
 }
 
@@ -471,7 +518,6 @@ func TestCleanupStateFiles(t *testing.T) {
 	for _, path := range []string{
 		pidPath(dir),
 		portPath(dir),
-		activityPath(dir),
 	} {
 		if err := os.WriteFile(path, []byte("test"), 0600); err != nil {
 			t.Fatal(err)
@@ -483,30 +529,10 @@ func TestCleanupStateFiles(t *testing.T) {
 	for _, path := range []string{
 		pidPath(dir),
 		portPath(dir),
-		activityPath(dir),
 	} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("expected %s to be removed", filepath.Base(path))
 		}
-	}
-}
-
-// --- Idle monitor tests ---
-
-func TestRunIdleMonitorDisabled(t *testing.T) {
-	// idleTimeout=0 should return immediately
-	dir := t.TempDir()
-	done := make(chan struct{})
-	go func() {
-		RunIdleMonitor(dir, 0)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// good — returned immediately
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunIdleMonitor(0) should return immediately")
 	}
 }
 
@@ -518,35 +544,6 @@ func TestFlushWorkingSetUnreachable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not reachable") {
 		t.Errorf("expected 'not reachable' in error, got: %v", err)
-	}
-}
-
-func TestMonitorPidLifecycle(t *testing.T) {
-	dir := t.TempDir()
-
-	// No monitor running
-	if isMonitorRunning(dir) {
-		t.Error("expected no monitor running initially")
-	}
-
-	// Write our own PID as monitor (we know we're alive)
-	_ = os.WriteFile(monitorPidPath(dir), []byte(strconv.Itoa(os.Getpid())), 0600)
-	if !isMonitorRunning(dir) {
-		t.Error("expected monitor to be detected as running")
-	}
-
-	// Don't call stopIdleMonitor with our own PID (it sends SIGTERM).
-	// Instead test with a dead PID.
-	_ = os.Remove(monitorPidPath(dir))
-	_ = os.WriteFile(monitorPidPath(dir), []byte("99999999"), 0600)
-	if isMonitorRunning(dir) {
-		t.Error("expected dead PID to not be detected as running")
-	}
-
-	// stopIdleMonitor should clean up the PID file
-	stopIdleMonitor(dir)
-	if _, err := os.Stat(monitorPidPath(dir)); !os.IsNotExist(err) {
-		t.Error("expected monitor PID file to be removed")
 	}
 }
 
@@ -564,55 +561,83 @@ func TestIsDoltProcessSelf(t *testing.T) {
 	}
 }
 
-// --- Multi-project port fallback tests ---
+// --- Ephemeral port tests ---
 
-func TestReclaimPortOccupiedByOtherProject(t *testing.T) {
-	// When a Dolt server is running on our port but serving a DIFFERENT data dir,
-	// reclaimPort should return ErrPortOccupiedByOtherProject instead of killing it.
-	// This allows Start() to fall back to DerivePort for per-project isolation.
-	//
-	// We can't easily fake a real Dolt process in a unit test, but we can verify
-	// the sentinel error exists and is used correctly by the Start fallback logic.
-	if ErrPortOccupiedByOtherProject == nil {
-		t.Fatal("ErrPortOccupiedByOtherProject sentinel must be defined")
-	}
-}
-
-func TestStartFallsBackToDerivePortOnCollision(t *testing.T) {
-	// When Start() finds another project's Dolt server on the DerivePort,
-	// it should fall back gracefully rather than killing the other server.
-	dir := t.TempDir()
-
-	t.Setenv("GT_ROOT", "")
-	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
-
-	cfg := DefaultConfig(dir)
-	expected := DerivePort(dir)
-	if cfg.Port != expected {
-		t.Fatalf("expected DerivePort %d, got %d", expected, cfg.Port)
-	}
-
-	// The fallback port should be a DerivePort value (13307-14306 range)
-	fallback := fallbackPort(dir)
-	if fallback < portRangeBase || fallback >= portRangeBase+portRangeSize {
-		t.Errorf("fallbackPort(%q) = %d, expected in DerivePort range [%d, %d)",
-			dir, fallback, portRangeBase, portRangeBase+portRangeSize)
-	}
-}
-
-func TestDefaultConfigReturnsDerivePortForStandalone(t *testing.T) {
-	// DefaultConfig must return DerivePort for standalone mode so that each
-	// project gets an isolated port. This prevents multi-project setups from
-	// all trying to connect to the same port (3307).
+func TestDefaultConfigReturnsZeroForStandalone(t *testing.T) {
+	// DefaultConfig must return port 0 for standalone mode (no configured
+	// port source). Start() will allocate an ephemeral port from the OS,
+	// giving each project a unique port without hash collisions (GH#2098).
 	t.Setenv("GT_ROOT", "")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	expected := DerivePort(dir)
-	if cfg.Port != expected {
-		t.Errorf("DefaultConfig should return DerivePort (%d) for standalone, got %d",
-			expected, cfg.Port)
+	if cfg.Port != 0 {
+		t.Errorf("DefaultConfig should return port 0 (ephemeral) for standalone, got %d",
+			cfg.Port)
+	}
+}
+
+func TestDefaultConfigEnvVarOverridesEphemeral(t *testing.T) {
+	// Explicit env var should always take precedence over ephemeral.
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "15000")
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	if cfg.Port != 15000 {
+		t.Errorf("expected env var port 15000, got %d", cfg.Port)
+	}
+}
+
+func TestDefaultConfigPortFileTakesPrecedence(t *testing.T) {
+	// Port file (written by Start) should take precedence over ephemeral.
+	t.Setenv("GT_ROOT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	dir := t.TempDir()
+	if err := writePortFile(dir, 14567); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig(dir)
+	if cfg.Port != 14567 {
+		t.Errorf("expected port file port 14567, got %d", cfg.Port)
+	}
+}
+
+func TestReadPortFile_Empty(t *testing.T) {
+	// ReadPortFile on a directory with no port file should return 0.
+	dir := t.TempDir()
+	if p := ReadPortFile(dir); p != 0 {
+		t.Errorf("expected 0 for missing port file, got %d", p)
+	}
+}
+
+func TestReadPortFile_Valid(t *testing.T) {
+	dir := t.TempDir()
+	if err := writePortFile(dir, 12345); err != nil {
+		t.Fatal(err)
+	}
+	if p := ReadPortFile(dir); p != 12345 {
+		t.Errorf("expected 12345, got %d", p)
+	}
+}
+
+// TestReadPortFile_IgnoresConfigYaml verifies that ReadPortFile only reads
+// the port file, NOT config.yaml. This is the crux of the GH#2336 fix:
+// bd init uses ReadPortFile instead of DefaultConfig to avoid inheriting
+// another project's port from config.yaml or global config.
+func TestReadPortFile_IgnoresConfigYaml(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a config.yaml with a dolt port (simulating another project's config)
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("dolt:\n  port: 9999\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// ReadPortFile must return 0 — it should ONLY read the port file,
+	// not config.yaml. This prevents cross-project leakage during init.
+	if p := ReadPortFile(dir); p != 0 {
+		t.Errorf("ReadPortFile should ignore config.yaml, got port %d", p)
 	}
 }
 
@@ -757,89 +782,131 @@ func TestEnsureDoltInit_WritesMarker(t *testing.T) {
 	}
 }
 
-// --- stopServerProcess tests ---
+// --- Shared Server Mode Tests (GH#2377) ---
 
-func TestStopServerProcessPreservesMonitorAndActivity(t *testing.T) {
-	// stopServerProcess must leave the monitor PID file and activity file
-	// intact. This is the core fix for GH#2324: the idle monitor calls
-	// stopServerProcess (not Stop) to avoid killing itself via
-	// cleanupStateFiles → stopIdleMonitor.
-	dir := t.TempDir()
-	t.Setenv("GT_ROOT", "")
-
-	// Write activity and monitor PID files
-	touchActivity(dir)
-	monitorPID := os.Getpid()
-	_ = os.WriteFile(monitorPidPath(dir), []byte(strconv.Itoa(monitorPID)), 0600)
-
-	// No server PID file → stopServerProcess returns immediately (already stopped)
-	if err := stopServerProcess(dir); err != nil {
-		t.Fatalf("stopServerProcess: %v", err)
+func TestIsSharedServerMode_Default(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	config.ResetForTesting()
+	if IsSharedServerMode() {
+		t.Error("expected per-project mode by default")
 	}
+}
 
-	// Activity file must be preserved
-	if _, err := os.Stat(activityPath(dir)); os.IsNotExist(err) {
-		t.Error("stopServerProcess must preserve activity file")
+func TestIsSharedServerMode_EnvVar1(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	if !IsSharedServerMode() {
+		t.Error("expected shared server mode with BEADS_DOLT_SHARED_SERVER=1")
 	}
-	// Monitor PID file must be preserved
-	if _, err := os.Stat(monitorPidPath(dir)); os.IsNotExist(err) {
-		t.Error("stopServerProcess must preserve monitor PID file")
+}
+
+func TestIsSharedServerMode_EnvVarTrue(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "true")
+	if !IsSharedServerMode() {
+		t.Error("expected shared server mode with BEADS_DOLT_SHARED_SERVER=true")
 	}
-	// Monitor PID should still contain our PID (not corrupted)
-	data, err := os.ReadFile(monitorPidPath(dir))
+}
+
+func TestIsSharedServerMode_EnvVarTRUE(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "TRUE")
+	if !IsSharedServerMode() {
+		t.Error("expected shared server mode with BEADS_DOLT_SHARED_SERVER=TRUE (case-insensitive)")
+	}
+}
+
+func TestIsSharedServerMode_EnvVar0(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "0")
+	config.ResetForTesting()
+	if IsSharedServerMode() {
+		t.Error("expected per-project mode with BEADS_DOLT_SHARED_SERVER=0")
+	}
+}
+
+func TestSharedServerDir(t *testing.T) {
+	dir, err := SharedServerDir()
 	if err != nil {
-		t.Fatalf("reading monitor PID file: %v", err)
+		t.Fatalf("SharedServerDir: %v", err)
 	}
-	if pid, _ := strconv.Atoi(strings.TrimSpace(string(data))); pid != monitorPID {
-		t.Errorf("monitor PID file changed: want %d, got %d", monitorPID, pid)
+	home, _ := os.UserHomeDir()
+	expected := filepath.Join(home, ".beads", "shared-server")
+	if dir != expected {
+		t.Errorf("SharedServerDir = %q, want %q", dir, expected)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		t.Errorf("expected directory to exist: %s", dir)
 	}
 }
 
-func TestStopServerProcessRemovesPidAndPort(t *testing.T) {
-	// When the server is running (simulated with a stale PID that IsRunning
-	// will clean up), stopServerProcess should remove PID and port files
-	// but leave activity and monitor files intact.
+func TestSharedDoltDir(t *testing.T) {
+	dir, err := SharedDoltDir()
+	if err != nil {
+		t.Fatalf("SharedDoltDir: %v", err)
+	}
+	home, _ := os.UserHomeDir()
+	expected := filepath.Join(home, ".beads", "shared-server", "dolt")
+	if dir != expected {
+		t.Errorf("SharedDoltDir = %q, want %q", dir, expected)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		t.Errorf("expected directory to exist: %s", dir)
+	}
+}
+
+func TestResolveServerDir_PerProject(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	config.ResetForTesting()
+	result := resolveServerDir("/some/project/.beads")
+	if result != "/some/project/.beads" {
+		t.Errorf("expected per-project dir, got %s", result)
+	}
+}
+
+func TestResolveServerDir_SharedMode(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	result := resolveServerDir("/some/project/.beads")
+	home, _ := os.UserHomeDir()
+	expected := filepath.Join(home, ".beads", "shared-server")
+	if result != expected {
+		t.Errorf("resolveServerDir with shared mode = %q, want %q", result, expected)
+	}
+}
+
+func TestDefaultConfig_SharedModeFixedPort(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	if cfg.Port != DefaultSharedServerPort {
+		t.Errorf("shared mode: expected port %d (DefaultSharedServerPort), got %d", DefaultSharedServerPort, cfg.Port)
+	}
+}
+
+func TestDefaultConfig_SharedModeGeneralPortOverrides(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "5000")
 	t.Setenv("GT_ROOT", "")
-
-	// Write all state files
-	_ = os.WriteFile(pidPath(dir), []byte("99999999"), 0600) // dead PID
-	_ = writePortFile(dir, 13500)
-	touchActivity(dir)
-	_ = os.WriteFile(monitorPidPath(dir), []byte(strconv.Itoa(os.Getpid())), 0600)
-
-	// stopServerProcess: IsRunning sees dead PID → returns Running=false →
-	// stopServerProcess returns nil (already stopped).
-	_ = stopServerProcess(dir)
-
-	// PID file was cleaned up by IsRunning (stale PID detection)
-	if _, err := os.Stat(pidPath(dir)); !os.IsNotExist(err) {
-		t.Error("expected server PID file to be removed")
-	}
-
-	// Activity and monitor PID files must survive
-	if _, err := os.Stat(activityPath(dir)); os.IsNotExist(err) {
-		t.Error("stopServerProcess must preserve activity file")
-	}
-	if _, err := os.Stat(monitorPidPath(dir)); os.IsNotExist(err) {
-		t.Error("stopServerProcess must preserve monitor PID file")
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	if cfg.Port != 5000 {
+		t.Errorf("BEADS_DOLT_SERVER_PORT should override shared mode default, got %d", cfg.Port)
 	}
 }
 
-func TestRunIdleMonitorZeroTimeoutExitsImmediately(t *testing.T) {
-	// With zero timeout, the monitor should exit immediately.
-	dir := t.TempDir()
+func TestDefaultSharedServerPort_DiffersFromDefault(t *testing.T) {
+	if DefaultSharedServerPort == configfile.DefaultDoltServerPort {
+		t.Errorf("DefaultSharedServerPort (%d) must differ from DefaultDoltServerPort (%d) to avoid Gas Town conflict",
+			DefaultSharedServerPort, configfile.DefaultDoltServerPort)
+	}
+}
 
-	done := make(chan struct{})
-	go func() {
-		RunIdleMonitor(dir, 0)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// good — exited immediately with zero timeout
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunIdleMonitor should exit immediately with zero timeout")
+func TestDefaultConfig_SharedModeBeadsDir(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	cfg := DefaultConfig("/some/project/.beads")
+	home, _ := os.UserHomeDir()
+	expected := filepath.Join(home, ".beads", "shared-server")
+	if cfg.BeadsDir != expected {
+		t.Errorf("DefaultConfig.BeadsDir = %q, want %q", cfg.BeadsDir, expected)
 	}
 }

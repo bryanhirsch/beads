@@ -18,6 +18,8 @@ func transact(ctx context.Context, s *dolt.DoltStore, commitMsg string, fn func(
 	err := s.RunInTransaction(ctx, commitMsg, fn)
 	if err == nil {
 		commandDidExplicitDoltCommit = true
+		// Write .beads/HEAD and refs after successful transaction commit
+		writeBeadsRefs(ctx, s)
 	}
 	return err
 }
@@ -36,7 +38,7 @@ type doltAutoCommitParams struct {
 // Semantics:
 //   - Only applies when dolt auto-commit is "on" AND the active store is versioned (Dolt).
 //   - In "batch" mode, commits are deferred — changes accumulate in the working set
-//     until an explicit commit point (bd sync, bd dolt commit).
+//     until an explicit commit point (bd dolt commit).
 //   - Uses Dolt's "commit all" behavior under the hood (DOLT_COMMIT -Am).
 //   - Treats "nothing to commit" as a no-op.
 func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
@@ -45,7 +47,7 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 		return err
 	}
 	// In batch mode, skip per-command commits. Changes stay in the working set
-	// and are committed at logical boundaries (bd sync, bd dolt commit).
+	// and are committed at logical boundaries (bd dolt commit).
 	if mode != doltAutoCommitOn {
 		return nil
 	}
@@ -66,6 +68,10 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 		}
 		return err
 	}
+
+	// Write .beads/HEAD and refs after successful commit
+	writeBeadsRefs(ctx, st)
+
 	return nil
 }
 

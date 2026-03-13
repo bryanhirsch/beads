@@ -204,6 +204,7 @@ func applyFixList(path string, fixes []doctorCheck) {
 	// Rough dependency chain:
 	// permissions/lock cleanup → config sanity → DB integrity/migrations.
 	order := []string{
+		"Metadata Config",
 		"Lock Files",
 		"Permissions",
 		"Database Config",
@@ -212,6 +213,7 @@ func applyFixList(path string, fixes []doctorCheck) {
 		"Database",
 		"Fresh Clone",
 		"Schema Compatibility",
+		"Project Identity",
 	}
 	priority := make(map[string]int, len(order))
 	for i, name := range order {
@@ -243,6 +245,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 
 		var err error
 		switch check.Name {
+		case "Metadata Config":
+			err = fix.FixMissingMetadataJSON(path)
 		case "Gitignore":
 			err = doctor.FixGitignore(path)
 		case "Project Gitignore":
@@ -251,6 +255,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = doctor.FixRedirectTracking(path)
 		case "Last-Touched Tracking":
 			err = doctor.FixLastTouchedTracking(path)
+		case "Tracked Runtime Files":
+			err = doctor.FixTrackedRuntimeFiles(path)
 		case "Git Hooks":
 			err = fix.GitHooks(path)
 		case "Sync Divergence":
@@ -283,8 +289,6 @@ func applyFixList(path string, fixes []doctorCheck) {
 		case "Untracked Files":
 			fmt.Printf("  ⚠ Untracked JSONL fix removed (Dolt-native storage)\n")
 			continue
-		case "Merge Artifacts":
-			err = fix.MergeArtifacts(path)
 		case "Orphaned Dependencies":
 			err = fix.OrphanedDependencies(path, doctorVerbose)
 		case "Child-Parent Dependencies":
@@ -331,6 +335,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = fix.ConfigValues(path)
 		case "Classic Artifacts":
 			err = fix.ClassicArtifacts(path)
+		case "Project Identity":
+			err = fix.FixProjectIdentity(path)
 		case "Remote Consistency":
 			err = fix.RemoteConsistency(path)
 		case "Dolt Schema":

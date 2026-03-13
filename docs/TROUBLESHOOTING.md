@@ -55,7 +55,7 @@ bd list
 ```bash
 # Debug timestamp protection during sync
 export BD_DEBUG_SYNC=1
-bd sync
+bd dolt push
 
 # Example output:
 # [debug] Protected bd-123: local=2024-01-20T10:00:00Z >= incoming=2024-01-20T09:55:00Z
@@ -107,7 +107,7 @@ bd dolt start
 
 - **Capture debug output**: Redirect stderr to a file for analysis:
   ```bash
-  BD_DEBUG=1 bd sync 2> debug.log
+  BD_DEBUG=1 bd dolt push 2> debug.log
   ```
 
 - **Server logs**: `BD_DEBUG_FRESHNESS` output goes to server logs, not stderr:
@@ -228,6 +228,27 @@ If you installed via Homebrew, this shouldn't be necessary as the formula alread
 
 ## Database Issues
 
+### Port conflicts with multiple projects
+
+**Symptom:** Running `bd init` or `bd` commands in a second project fails or connects to the wrong database. Multiple `dolt sql-server` processes are running.
+
+**Cause:** By default, each beads project starts its own Dolt server. On machines with multiple projects, this can cause port conflicts or resource waste.
+
+**Fix:** Enable shared server mode so all projects use a single Dolt server:
+
+```bash
+# Option 1: Machine-wide (add to ~/.bashrc or ~/.zshrc)
+export BEADS_DOLT_SHARED_SERVER=1
+
+# Option 2: Per-project
+cd ~/project1 && bd dolt set shared-server true
+cd ~/project2 && bd dolt set shared-server true
+```
+
+After enabling, existing projects may need `bd init --force -q` to create their database on the shared server.
+
+**Verify:** `bd dolt status` from any project should show the same PID, port 3308, and `~/.beads/shared-server/` as the data directory.
+
 ### `bd` shows 0 issues but the database has data
 
 **Symptom:** All `bd` commands return empty results. `bd list` shows nothing.
@@ -312,29 +333,26 @@ bd init
 
 ### `failed to import: issue already exists`
 
-You're trying to import issues that conflict with existing ones. Options:
+You're trying to bootstrap a database with issues that conflict with existing ones. Options:
 
 ```bash
-# Skip existing issues (only import new ones)
-bd import -i issues.jsonl --skip-existing
-
-# Or clear database and re-import from an export
+# Clear database and re-initialize from an export
 rm -rf .beads/dolt
-bd import -i backup.jsonl
+bd init --from-jsonl
 ```
 
 ### Import fails with missing parent errors
 
-If you see errors like `parent issue bd-abc does not exist` when importing hierarchical issues (e.g., `bd-abc.1`, `bd-abc.2`), this means the parent issue was deleted but children still reference it.
+If you see errors like `parent issue bd-abc does not exist` when bootstrapping from JSONL or pulling hierarchical issues (e.g., `bd-abc.1`, `bd-abc.2`), this means the parent issue was deleted but children still reference it.
 
 **Quick fix using resurrection:**
 
 ```bash
-# Auto-resurrect deleted parents from import data
-bd import -i issues.jsonl --orphan-handling resurrect
-
-# Or set as default behavior
+# Set orphan handling to auto-resurrect deleted parents
 bd config set import.orphan_handling "resurrect"
+
+# Then pull or re-initialize
+bd dolt pull
 ```
 
 **What resurrection does:**
@@ -429,8 +447,8 @@ For **physical database corruption** (disk failures, power loss, filesystem erro
 mv .beads/dolt .beads/dolt.backup
 bd init
 bd dolt pull    # Pull from Dolt remote if configured
-# Or import from a backup export:
-# bd import -i backup.jsonl
+# Or re-initialize from a backup export:
+# bd init --from-jsonl
 ```
 
 For **logical consistency issues** (ID collisions from branch merges, parallel workers):
@@ -587,7 +605,7 @@ $ git checkout main
 fatal: 'main' is already checked out at '/path/to/.git/beads-worktrees/beads-sync'
 ```
 
-**Cause:** Beads creates git worktrees internally when using the sync-branch feature (configured via `bd init --branch` or `bd config set sync.branch`). These worktrees lock the branches they're checked out to.
+**Cause:** Beads previously created git worktrees internally for a sync-branch feature (configured via `bd config set sync.branch`). These worktrees lock the branches they're checked out to. This feature has been removed; Dolt now stores data under `refs/dolt/data`, separate from standard Git refs.
 
 **Solution:**
 ```bash
@@ -804,12 +822,11 @@ See [integrations/beads-mcp/README.md](../integrations/beads-mcp/README.md) for 
 **Issue:** Sandboxed environments restrict permissions, preventing server control and causing "out of sync" errors.
 
 **Common symptoms:**
-- "Database out of sync" errors that persist after running `bd import`
+- "Database out of sync" errors that persist after running `bd dolt pull`
 - `bd dolt stop` fails with "operation not permitted"
 - Hash mismatch warnings (bd-160)
-- Commands intermittently fail with staleness errors
 
-**Root cause:** The sandbox can't signal/kill the existing Dolt server process, so the DB stays stale.
+**Root cause:** The sandbox can't signal/kill the existing Dolt server process.
 
 ---
 
@@ -837,7 +854,7 @@ bd --sandbox update bd-42 --claim
 **Note:** You'll need to manually sync when outside the sandbox:
 ```bash
 # After leaving sandbox, sync manually
-bd sync
+bd dolt push
 ```
 
 ---
@@ -846,41 +863,24 @@ bd sync
 
 If you're stuck in a "database out of sync" loop with a running server you can't stop, use these flags:
 
-**1. Force metadata update (`--force` flag on import)**
+**1. Force metadata update**
 
-When `bd import` reports "0 created, 0 updated" but staleness persists:
+If staleness persists after pulling:
 
 ```bash
-# Force metadata refresh even when DB appears synced
-bd import --force
+# Force metadata refresh
+bd doctor --fix
 
 # This updates internal metadata tracking without changing issues
 # Fixes: stuck state caused by stale server cache
 ```
 
-**Shows:** `Metadata updated (database already in sync)`
-
-**2. Skip staleness check (`--allow-stale` global flag)**
-
-Emergency escape hatch to bypass staleness validation:
-
-```bash
-# Allow operations on potentially stale data
-bd --allow-stale ready
-bd --allow-stale list --status open
-
-# Shows warning:
-# ⚠️  Staleness check skipped (--allow-stale), data may be out of sync
-```
-
-**⚠️ Caution:** Use sparingly - you may see incomplete or outdated data.
-
-**3. Use sandbox mode (preferred)**
+**2. Use sandbox mode (preferred)**
 
 ```bash
 # Most reliable for sandboxed environments
 bd --sandbox ready
-bd --sandbox import -i backup.jsonl
+bd --sandbox dolt pull
 ```
 
 ---
@@ -893,14 +893,11 @@ If stuck in a sandboxed environment:
 # Step 1: Try sandbox mode (cleanest solution)
 bd --sandbox ready
 
-# Step 2: If you get staleness errors, force import
-bd import --force
+# Step 2: If you get staleness errors, force fix
+bd doctor --fix
 
-# Step 3: If still blocked, use allow-stale (emergency only)
-bd --allow-stale ready
-
-# Step 4: When back outside sandbox, sync normally
-bd sync
+# Step 3: When back outside sandbox, sync normally
+bd dolt push
 ```
 
 ---
@@ -910,8 +907,7 @@ bd sync
 | Flag | Purpose | When to use | Risk |
 |------|---------|-------------|------|
 | `--sandbox` | Use embedded mode, disable auto-sync | Sandboxed environments (Codex, containers) | Low - safe for sandboxes |
-| `--force` (import) | Force metadata update | Stuck "0 created, 0 updated" loop | Low - updates metadata only |
-| `--allow-stale` | Skip staleness validation | Emergency access to database | **High** - may show stale data |
+| `bd doctor --fix` | Force metadata update | Stuck staleness loop | Low - updates metadata only |
 
 **Related:**
 - See [Claude Code sandboxing documentation](https://www.anthropic.com/engineering/claude-code-sandboxing) for more about sandbox restrictions

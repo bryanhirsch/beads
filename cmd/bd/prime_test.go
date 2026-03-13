@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -154,6 +156,24 @@ func TestOutputContextFunction(t *testing.T) {
 	}
 }
 
+func TestPrimeClaimGuidanceUsesAtomicClaim(t *testing.T) {
+	defer stubIsEphemeralBranch(false)()
+	defer stubPrimeHasGitRemote(true)()
+
+	var buf bytes.Buffer
+	if err := outputPrimeContext(&buf, false, false); err != nil {
+		t.Fatalf("outputPrimeContext failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "bd update <id> --claim") {
+		t.Fatal("prime output should teach bd update <id> --claim")
+	}
+	if strings.Contains(output, "bd update <id> --status=in_progress") {
+		t.Fatal("prime output should not teach bd update <id> --status=in_progress")
+	}
+}
+
 // stubIsEphemeralBranch temporarily replaces isEphemeralBranch
 // with a stub returning returnValue.
 //
@@ -185,5 +205,42 @@ func stubPrimeHasGitRemote(hasRemote bool) func() {
 	}
 	return func() {
 		primeHasGitRemote = original
+	}
+}
+
+func TestPrimeGlobalFallback(t *testing.T) {
+	// Create a temp directory to act as config dir
+	tmpDir := t.TempDir()
+	beadsConfigDir := filepath.Join(tmpDir, "beads")
+	if err := os.MkdirAll(beadsConfigDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	content := "# Global PRIME override\nCustom instructions here.\n"
+	if err := os.WriteFile(filepath.Join(beadsConfigDir, "PRIME.md"), []byte(content), 0644); err != nil {
+		t.Fatalf("write PRIME.md: %v", err)
+	}
+
+	// Call the helper that resolves the global prime path
+	got := resolveGlobalPrimePath(tmpDir)
+	if got == "" {
+		t.Fatal("resolveGlobalPrimePath returned empty, want path to global PRIME.md")
+	}
+
+	data, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", got, err)
+	}
+	if string(data) != content {
+		t.Errorf("content = %q, want %q", string(data), content)
+	}
+}
+
+func TestPrimeGlobalFallback_Missing(t *testing.T) {
+	// When no global PRIME.md exists, should return empty string
+	tmpDir := t.TempDir()
+	got := resolveGlobalPrimePath(tmpDir)
+	if got != "" {
+		t.Errorf("resolveGlobalPrimePath = %q, want empty for missing file", got)
 	}
 }

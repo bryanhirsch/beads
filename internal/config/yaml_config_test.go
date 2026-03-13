@@ -114,6 +114,35 @@ func TestUpdateYamlKey(t *testing.T) {
 			value:    "user: name",
 			expected: "other: value\n\nactor: \"user: name\"",
 		},
+		// Nested keys (dotted)
+		{
+			name:     "nested key appended when parent absent",
+			content:  "other: value",
+			key:      "branch_strategy.prompt",
+			value:    "true",
+			expected: "other: value\n\nbranch_strategy:\n  prompt: true",
+		},
+		{
+			name:     "nested key under existing parent",
+			content:  "branch_strategy:\n  prompt: true",
+			key:      "branch_strategy.defaults.reset_dolt_with_git",
+			value:    "false",
+			expected: "branch_strategy:\n  prompt: true\n  defaults:\n    reset_dolt_with_git: false",
+		},
+		{
+			name:     "nested key uncomments parent and child",
+			content:  "# branch_strategy:\n#   prompt: false",
+			key:      "branch_strategy.prompt",
+			value:    "true",
+			expected: "branch_strategy:\n  prompt: true",
+		},
+		{
+			name:    "nested key replaces flat dotted key",
+			content: "branch_strategy.prompt: false",
+			key:     "branch_strategy.prompt",
+			value:   "true",
+			expected: "branch_strategy:\n  prompt: true",
+		},
 	}
 
 	for _, tt := range tests {
@@ -278,5 +307,23 @@ func TestValidateYamlConfigValue_OtherKeys(t *testing.T) {
 	err = validateYamlConfigValue("routing.mode", "anything")
 	if err != nil {
 		t.Errorf("unexpected error for routing.mode: %v", err)
+	}
+}
+
+func TestValidateYamlConfigValue_SharedServer(t *testing.T) {
+	if err := validateYamlConfigValue("dolt.shared-server", "true"); err != nil {
+		t.Errorf("expected 'true' to be valid: %v", err)
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "false"); err != nil {
+		t.Errorf("expected 'false' to be valid: %v", err)
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "TRUE"); err != nil {
+		t.Errorf("expected 'TRUE' to be valid (case-insensitive): %v", err)
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "maybe"); err == nil {
+		t.Error("expected 'maybe' to be invalid")
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "1"); err == nil {
+		t.Error("expected '1' to be invalid (not a boolean string)")
 	}
 }

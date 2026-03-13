@@ -9,16 +9,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // Compile-time interface check.
-var _ storage.Storage = (*EmbeddedDoltStore)(nil)
+var _ storage.DoltStorage = (*EmbeddedDoltStore)(nil)
 
-// EmbeddedDoltStore implements storage.Storage backed by the embedded Dolt engine.
+// EmbeddedDoltStore implements storage.DoltStorage backed by the embedded Dolt engine.
 // Each method call opens a short-lived connection, executes within an explicit
 // SQL transaction, and closes the connection immediately. This minimizes the
 // time the embedded engine's write lock is held, reducing contention when
@@ -35,24 +37,80 @@ var errClosed = errors.New("embeddeddolt: store is closed")
 
 // New creates an EmbeddedDoltStore using the embedded Dolt engine.
 // beadsDir is the .beads/ root; the data directory is derived as <beadsDir>/embeddeddolt/.
-// New validates the configuration by opening and immediately closing a test connection.
 func New(ctx context.Context, beadsDir, database, branch string) (*EmbeddedDoltStore, error) {
-	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	// Resolve to absolute path — the embedded dolt driver resolves file://
+	// DSN paths relative to its data directory, so relative paths cause
+	// doubled-path errors on subsequent opens.
+	absBeadsDir, err := filepath.Abs(beadsDir)
+	if err != nil {
+		return nil, fmt.Errorf("embeddeddolt: resolving beads dir: %w", err)
+	}
+	dataDir := filepath.Join(absBeadsDir, "embeddeddolt")
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, fmt.Errorf("embeddeddolt: creating data directory: %w", err)
 	}
 
-	return &EmbeddedDoltStore{
+	s := &EmbeddedDoltStore{
 		dataDir:  dataDir,
 		database: database,
 		branch:   branch,
-	}, nil
+	}
+
+	if err := s.initSchema(ctx); err != nil {
+		return nil, fmt.Errorf("embeddeddolt: init schema: %w", err)
+	}
+
+	return s, nil
 }
 
-// withConn opens a short-lived database connection, begins an explicit SQL
-// transaction, and passes it to fn. If commit is true and fn returns nil, the
-// transaction is committed; otherwise it is rolled back. The connection is
-// closed before withConn returns regardless of outcome.
+// withRootConn opens a short-lived database connection without selecting any
+// database or branch, begins an explicit SQL transaction, and passes it to fn.
+// This is used during initialization when the database may not yet exist.
+func (s *EmbeddedDoltStore) withRootConn(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) (err error) {
+	if s.closed.Load() {
+		err = errClosed
+		return
+	}
+
+	var db *sql.DB
+	var cleanup func() error
+	db, cleanup, err = OpenSQL(ctx, s.dataDir, "", "")
+	if err != nil {
+		return
+	}
+
+	defer func() {
+		err = errors.Join(err, cleanup())
+	}()
+
+	var tx *sql.Tx
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		err = fmt.Errorf("embeddeddolt: begin tx: %w", err)
+		return
+	}
+
+	err = fn(tx)
+	if err != nil {
+		err = errors.Join(err, tx.Rollback())
+		return
+	}
+
+	if !commit {
+		return tx.Rollback()
+	}
+
+	err = tx.Commit()
+	return
+}
+
+// withConn opens a short-lived database connection configured for the store's
+// database and branch, begins an explicit SQL transaction, and passes it to
+// fn. If commit is true and fn returns nil, the transaction is committed;
+// otherwise it is rolled back. The connection is closed before withConn
+// returns regardless of outcome.
+//
+// The database must already exist (created during initSchema).
 func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) (err error) {
 	if s.closed.Load() {
 		err = errClosed
@@ -89,6 +147,45 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 
 	err = tx.Commit()
 	return
+}
+
+// initSchema creates the database (if needed) and runs all pending migrations,
+// committing them to Dolt history. Uses withRootConn so the database can be
+// created before USE; this avoids running CREATE DATABASE inside withConn,
+// which is not safe for concurrent use in the embedded Dolt engine.
+func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
+	return s.withRootConn(ctx, true, func(tx *sql.Tx) error {
+		if s.database != "" {
+			if !validIdentifier.MatchString(s.database) {
+				return fmt.Errorf("embeddeddolt: invalid database name: %q", s.database)
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+s.database+"`"); err != nil {
+				return fmt.Errorf("embeddeddolt: creating database: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, "USE `"+s.database+"`"); err != nil {
+				return fmt.Errorf("embeddeddolt: switching to database: %w", err)
+			}
+			if s.branch != "" {
+				if _, err := tx.ExecContext(ctx, fmt.Sprintf("SET @@%s_head_ref = %s", s.database, sqlStringLiteral(s.branch))); err != nil {
+					return fmt.Errorf("embeddeddolt: setting branch: %w", err)
+				}
+			}
+		}
+
+		applied, err := migrateUp(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if applied > 0 {
+			if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD('-A')"); err != nil {
+				return fmt.Errorf("dolt add after migrations: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'schema: apply migrations')"); err != nil {
+				return fmt.Errorf("dolt commit after migrations: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 func (s *EmbeddedDoltStore) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
@@ -200,19 +297,92 @@ func (s *EmbeddedDoltStore) GetAllEventsSince(ctx context.Context, sinceID int64
 }
 
 func (s *EmbeddedDoltStore) GetStatistics(ctx context.Context) (*types.Statistics, error) {
-	panic("embeddeddolt: GetStatistics not implemented")
+	stats := &types.Statistics{}
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) AS total,
+				COALESCE(SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN status = 'deferred' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END), 0)
+			FROM issues
+		`).Scan(
+			&stats.TotalIssues,
+			&stats.OpenIssues,
+			&stats.InProgressIssues,
+			&stats.ClosedIssues,
+			&stats.DeferredIssues,
+			&stats.PinnedIssues,
+		); err != nil {
+			return err
+		}
+
+		blockedIDs, err := computeBlockedIDs(ctx, tx, true)
+		if err != nil {
+			return err
+		}
+		stats.BlockedIssues = len(blockedIDs)
+		stats.ReadyIssues = stats.OpenIssues - stats.BlockedIssues
+		if stats.ReadyIssues < 0 {
+			stats.ReadyIssues = 0
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("embeddeddolt: get statistics: %w", err)
+	}
+	return stats, nil
 }
 
 func (s *EmbeddedDoltStore) SetConfig(ctx context.Context, key, value string) error {
-	panic("embeddeddolt: SetConfig not implemented")
+	// Normalize issue_prefix: strip trailing hyphen to avoid double-hyphen IDs,
+	// matching DoltStore behavior.
+	if key == "issue_prefix" {
+		value = strings.TrimSuffix(value, "-")
+	}
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "REPLACE INTO config (`key`, value) VALUES (?, ?)", key, value)
+		return err
+	})
 }
 
 func (s *EmbeddedDoltStore) GetConfig(ctx context.Context, key string) (string, error) {
-	panic("embeddeddolt: GetConfig not implemented")
+	var value string
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", key).Scan(&value)
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("embeddeddolt: get config %q: %w", key, err)
+	}
+	return value, nil
 }
 
 func (s *EmbeddedDoltStore) GetAllConfig(ctx context.Context) (map[string]string, error) {
-	panic("embeddeddolt: GetAllConfig not implemented")
+	result := make(map[string]string)
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, "SELECT `key`, value FROM config")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				return err
+			}
+			result[k] = v
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *EmbeddedDoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
@@ -224,4 +394,371 @@ func (s *EmbeddedDoltStore) RunInTransaction(ctx context.Context, commitMsg stri
 func (s *EmbeddedDoltStore) Close() error {
 	s.closed.Store(true)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// storage.VersionControl
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) Branch(ctx context.Context, name string) error {
+	panic("embeddeddolt: Branch not implemented")
+}
+
+func (s *EmbeddedDoltStore) Checkout(ctx context.Context, branch string) error {
+	panic("embeddeddolt: Checkout not implemented")
+}
+
+func (s *EmbeddedDoltStore) CurrentBranch(ctx context.Context) (string, error) {
+	panic("embeddeddolt: CurrentBranch not implemented")
+}
+
+func (s *EmbeddedDoltStore) DeleteBranch(ctx context.Context, branch string) error {
+	panic("embeddeddolt: DeleteBranch not implemented")
+}
+
+func (s *EmbeddedDoltStore) ListBranches(ctx context.Context) ([]string, error) {
+	panic("embeddeddolt: ListBranches not implemented")
+}
+
+func (s *EmbeddedDoltStore) Commit(ctx context.Context, message string) error {
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD('-A')"); err != nil {
+			return fmt.Errorf("dolt add: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?)", message); err != nil {
+			return fmt.Errorf("dolt commit: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s *EmbeddedDoltStore) CommitPending(ctx context.Context, actor string) (bool, error) {
+	panic("embeddeddolt: CommitPending not implemented")
+}
+
+func (s *EmbeddedDoltStore) CommitExists(ctx context.Context, commitHash string) (bool, error) {
+	panic("embeddeddolt: CommitExists not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetCurrentCommit(ctx context.Context) (string, error) {
+	panic("embeddeddolt: GetCurrentCommit not implemented")
+}
+
+func (s *EmbeddedDoltStore) Status(ctx context.Context) (*storage.Status, error) {
+	panic("embeddeddolt: Status not implemented")
+}
+
+func (s *EmbeddedDoltStore) Log(ctx context.Context, limit int) ([]storage.CommitInfo, error) {
+	panic("embeddeddolt: Log not implemented")
+}
+
+func (s *EmbeddedDoltStore) Merge(ctx context.Context, branch string) ([]storage.Conflict, error) {
+	panic("embeddeddolt: Merge not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetConflicts(ctx context.Context) ([]storage.Conflict, error) {
+	panic("embeddeddolt: GetConflicts not implemented")
+}
+
+func (s *EmbeddedDoltStore) ResolveConflicts(ctx context.Context, table string, strategy string) error {
+	panic("embeddeddolt: ResolveConflicts not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.HistoryViewer
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) History(ctx context.Context, issueID string) ([]*storage.HistoryEntry, error) {
+	panic("embeddeddolt: History not implemented")
+}
+
+func (s *EmbeddedDoltStore) AsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error) {
+	panic("embeddeddolt: AsOf not implemented")
+}
+
+func (s *EmbeddedDoltStore) Diff(ctx context.Context, fromRef, toRef string) ([]*storage.DiffEntry, error) {
+	panic("embeddeddolt: Diff not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.RemoteStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) AddRemote(ctx context.Context, name, url string) error {
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "CALL DOLT_REMOTE('add', ?, ?)", name, url)
+		return err
+	})
+}
+
+func (s *EmbeddedDoltStore) RemoveRemote(ctx context.Context, name string) error {
+	panic("embeddeddolt: RemoveRemote not implemented")
+}
+
+func (s *EmbeddedDoltStore) HasRemote(ctx context.Context, name string) (bool, error) {
+	var count int
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT count(*) FROM dolt_remotes WHERE name = ?", name).Scan(&count)
+	})
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (s *EmbeddedDoltStore) ListRemotes(ctx context.Context) ([]storage.RemoteInfo, error) {
+	panic("embeddeddolt: ListRemotes not implemented")
+}
+
+func (s *EmbeddedDoltStore) Push(ctx context.Context) error {
+	panic("embeddeddolt: Push not implemented")
+}
+
+func (s *EmbeddedDoltStore) Pull(ctx context.Context) error {
+	panic("embeddeddolt: Pull not implemented")
+}
+
+func (s *EmbeddedDoltStore) ForcePush(ctx context.Context) error {
+	panic("embeddeddolt: ForcePush not implemented")
+}
+
+func (s *EmbeddedDoltStore) Fetch(ctx context.Context, peer string) error {
+	panic("embeddeddolt: Fetch not implemented")
+}
+
+func (s *EmbeddedDoltStore) PushTo(ctx context.Context, peer string) error {
+	panic("embeddeddolt: PushTo not implemented")
+}
+
+func (s *EmbeddedDoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Conflict, error) {
+	panic("embeddeddolt: PullFrom not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.SyncStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) Sync(ctx context.Context, peer string, strategy string) (*storage.SyncResult, error) {
+	panic("embeddeddolt: Sync not implemented")
+}
+
+func (s *EmbeddedDoltStore) SyncStatus(ctx context.Context, peer string) (*storage.SyncStatus, error) {
+	panic("embeddeddolt: SyncStatus not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.FederationStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) AddFederationPeer(ctx context.Context, peer *storage.FederationPeer) error {
+	panic("embeddeddolt: AddFederationPeer not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetFederationPeer(ctx context.Context, name string) (*storage.FederationPeer, error) {
+	panic("embeddeddolt: GetFederationPeer not implemented")
+}
+
+func (s *EmbeddedDoltStore) ListFederationPeers(ctx context.Context) ([]*storage.FederationPeer, error) {
+	panic("embeddeddolt: ListFederationPeers not implemented")
+}
+
+func (s *EmbeddedDoltStore) RemoveFederationPeer(ctx context.Context, name string) error {
+	panic("embeddeddolt: RemoveFederationPeer not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.BulkIssueStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*types.Issue, actor string, opts storage.BatchCreateOptions) error {
+	panic("embeddeddolt: CreateIssuesWithFullOptions not implemented")
+}
+
+func (s *EmbeddedDoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool, force bool, dryRun bool) (*types.DeleteIssuesResult, error) {
+	panic("embeddeddolt: DeleteIssues not implemented")
+}
+
+func (s *EmbeddedDoltStore) DeleteIssuesBySourceRepo(ctx context.Context, sourceRepo string) (int, error) {
+	panic("embeddeddolt: DeleteIssuesBySourceRepo not implemented")
+}
+
+func (s *EmbeddedDoltStore) UpdateIssueID(ctx context.Context, oldID, newID string, issue *types.Issue, actor string) error {
+	panic("embeddeddolt: UpdateIssueID not implemented")
+}
+
+func (s *EmbeddedDoltStore) ClaimIssue(ctx context.Context, id string, actor string) error {
+	panic("embeddeddolt: ClaimIssue not implemented")
+}
+
+func (s *EmbeddedDoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor string) error {
+	panic("embeddeddolt: PromoteFromEphemeral not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetNextChildID(ctx context.Context, parentID string) (string, error) {
+	panic("embeddeddolt: GetNextChildID not implemented")
+}
+
+func (s *EmbeddedDoltStore) RenameCounterPrefix(ctx context.Context, oldPrefix, newPrefix string) error {
+	panic("embeddeddolt: RenameCounterPrefix not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.DependencyQueryStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
+	panic("embeddeddolt: GetDependencyRecords not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetDependencyRecordsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Dependency, error) {
+	panic("embeddeddolt: GetDependencyRecordsForIssues not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetAllDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error) {
+	panic("embeddeddolt: GetAllDependencyRecords not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetDependencyCounts(ctx context.Context, issueIDs []string) (map[string]*types.DependencyCounts, error) {
+	panic("embeddeddolt: GetDependencyCounts not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetBlockingInfoForIssues(ctx context.Context, issueIDs []string) (blockedByMap map[string][]string, blocksMap map[string][]string, parentMap map[string]string, err error) {
+	panic("embeddeddolt: GetBlockingInfoForIssues not implemented")
+}
+
+func (s *EmbeddedDoltStore) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
+	panic("embeddeddolt: IsBlocked not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetNewlyUnblockedByClose(ctx context.Context, closedIssueID string) ([]*types.Issue, error) {
+	panic("embeddeddolt: GetNewlyUnblockedByClose not implemented")
+}
+
+func (s *EmbeddedDoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) {
+	panic("embeddeddolt: DetectCycles not implemented")
+}
+
+func (s *EmbeddedDoltStore) FindWispDependentsRecursive(ctx context.Context, ids []string) (map[string]bool, error) {
+	panic("embeddeddolt: FindWispDependentsRecursive not implemented")
+}
+
+func (s *EmbeddedDoltStore) RenameDependencyPrefix(ctx context.Context, oldPrefix, newPrefix string) error {
+	panic("embeddeddolt: RenameDependencyPrefix not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.AnnotationQueryStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) AddComment(ctx context.Context, issueID, actor, comment string) error {
+	panic("embeddeddolt: AddComment not implemented")
+}
+
+func (s *EmbeddedDoltStore) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error) {
+	panic("embeddeddolt: ImportIssueComment not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetCommentCounts(ctx context.Context, issueIDs []string) (map[string]int, error) {
+	panic("embeddeddolt: GetCommentCounts not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetCommentsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Comment, error) {
+	panic("embeddeddolt: GetCommentsForIssues not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetLabelsForIssues(ctx context.Context, issueIDs []string) (map[string][]string, error) {
+	panic("embeddeddolt: GetLabelsForIssues not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.ConfigMetadataStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) GetMetadata(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = ?", key).Scan(&value)
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("GetMetadata(%q): %w", key, err)
+	}
+	return value, nil
+}
+
+func (s *EmbeddedDoltStore) SetMetadata(ctx context.Context, key, value string) error {
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "REPLACE INTO metadata (`key`, value) VALUES (?, ?)", key, value)
+		return err
+	})
+}
+
+func (s *EmbeddedDoltStore) DeleteConfig(ctx context.Context, key string) error {
+	panic("embeddeddolt: DeleteConfig not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetCustomStatuses(ctx context.Context) ([]string, error) {
+	panic("embeddeddolt: GetCustomStatuses not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetCustomTypes(ctx context.Context) ([]string, error) {
+	panic("embeddeddolt: GetCustomTypes not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetInfraTypes(ctx context.Context) map[string]bool {
+	panic("embeddeddolt: GetInfraTypes not implemented")
+}
+
+func (s *EmbeddedDoltStore) IsInfraTypeCtx(ctx context.Context, t types.IssueType) bool {
+	panic("embeddeddolt: IsInfraTypeCtx not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.CompactionStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) CheckEligibility(ctx context.Context, issueID string, tier int) (bool, string, error) {
+	panic("embeddeddolt: CheckEligibility not implemented")
+}
+
+func (s *EmbeddedDoltStore) ApplyCompaction(ctx context.Context, issueID string, tier int, originalSize int, compactedSize int, commitHash string) error {
+	panic("embeddeddolt: ApplyCompaction not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetTier1Candidates(ctx context.Context) ([]*types.CompactionCandidate, error) {
+	panic("embeddeddolt: GetTier1Candidates not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetTier2Candidates(ctx context.Context) ([]*types.CompactionCandidate, error) {
+	panic("embeddeddolt: GetTier2Candidates not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// storage.AdvancedQueryStore
+// ---------------------------------------------------------------------------
+
+func (s *EmbeddedDoltStore) GetRepoMtime(ctx context.Context, repoPath string) (int64, error) {
+	panic("embeddeddolt: GetRepoMtime not implemented")
+}
+
+func (s *EmbeddedDoltStore) SetRepoMtime(ctx context.Context, repoPath, jsonlPath string, mtimeNs int64) error {
+	panic("embeddeddolt: SetRepoMtime not implemented")
+}
+
+func (s *EmbeddedDoltStore) ClearRepoMtime(ctx context.Context, repoPath string) error {
+	panic("embeddeddolt: ClearRepoMtime not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetMoleculeProgress(ctx context.Context, moleculeID string) (*types.MoleculeProgressStats, error) {
+	panic("embeddeddolt: GetMoleculeProgress not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetMoleculeLastActivity(ctx context.Context, moleculeID string) (*types.MoleculeLastActivity, error) {
+	panic("embeddeddolt: GetMoleculeLastActivity not implemented")
+}
+
+func (s *EmbeddedDoltStore) GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error) {
+	panic("embeddeddolt: GetStaleIssues not implemented")
 }

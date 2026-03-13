@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -26,13 +29,18 @@ func TestInitGuardServerMessage(t *testing.T) {
 				"127.0.0.1:3309",
 				"not found on server",
 				"server is running but this database hasn't been created yet",
-				"bd init --force --prefix acf",
+				"bd doctor",
+				"bd dolt status",
+				"bd init --prefix acf",
 				"set sync.git-remote",
 				".beads/config.yaml",
 				"Aborting",
+				"--force destroys ALL existing issues",
 			},
 			wantNotContain: []string{
 				"sync.git-remote is configured",
+				// GH#2363: must NOT suggest --force as the primary action
+				"bd init --force --prefix",
 			},
 		},
 		"DB missing, sync.git-remote IS configured (FR-010, FR-011)": {
@@ -46,13 +54,19 @@ func TestInitGuardServerMessage(t *testing.T) {
 				"192.168.1.50:3307",
 				"not found on server",
 				"server is running but this database hasn't been created yet",
-				"bd init --force --prefix kc",
+				"bd doctor",
+				"bd dolt status",
+				"bd init --prefix kc",
 				"sync.git-remote is configured",
 				"https://doltremoteapi.dolthub.com/myorg/beads",
-				"bd init --force to bootstrap from the remote",
+				"existing data is preserved",
+				"--force destroys ALL existing issues",
 			},
 			wantNotContain: []string{
 				"set sync.git-remote",
+				// GH#2363: must NOT suggest --force as the primary action
+				"bd init --force --prefix",
+				"bd init --force to bootstrap",
 			},
 		},
 	}
@@ -125,4 +139,137 @@ func TestInitGuardDBCheck_ServerUnreachable(t *testing.T) {
 		t.Fatal("expected non-nil error for connection refused")
 	}
 	// Key assertion: no panic occurred — FR-030 satisfied.
+}
+
+func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
+	// GH#2433: On a fresh clone, metadata.json is committed (tracked by git)
+	// but dolt/ directory is gitignored. The init guard should recognize this
+	// as a fresh clone and allow init to proceed.
+
+	t.Run("server_mode_metadata_no_dolt_dir_allows_init", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write metadata.json as it would be on a fresh clone:
+		// DoltMode=server, DoltDatabase set, but no dolt/ directory.
+		metadata := map[string]interface{}{
+			"database":      "dolt",
+			"backend":       "dolt",
+			"dolt_mode":     "server",
+			"dolt_database": "myproject",
+		}
+		data, _ := json.Marshal(metadata)
+		metadataPath := filepath.Join(beadsDir, "metadata.json")
+		if err := os.WriteFile(metadataPath, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// No dolt/ directory — simulates fresh clone with gitignored dolt/.
+		// No server running — simulates machine B with no local server.
+		err := checkExistingBeadsDataAt(beadsDir, "myproject")
+		if err != nil {
+			t.Errorf("fresh clone with metadata.json should allow init, got: %v", err)
+		}
+	})
+
+	t.Run("server_mode_with_dolt_dir_blocks_init", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write metadata.json with server mode
+		metadata := map[string]interface{}{
+			"database":      "dolt",
+			"backend":       "dolt",
+			"dolt_mode":     "server",
+			"dolt_database": "myproject",
+		}
+		data, _ := json.Marshal(metadata)
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create dolt/ directory — this is NOT a fresh clone
+		doltDir := filepath.Join(beadsDir, "dolt")
+		if err := os.MkdirAll(doltDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		err := checkExistingBeadsDataAt(beadsDir, "myproject")
+		if err == nil {
+			t.Error("existing dolt directory should block init")
+		}
+		if err != nil && !strings.Contains(err.Error(), "already initialized") {
+			t.Errorf("expected 'already initialized' message, got: %v", err)
+		}
+	})
+
+	t.Run("no_metadata_json_allows_init", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// No metadata.json, no dolt/ — fresh project, never initialized
+		err := checkExistingBeadsDataAt(beadsDir, "test")
+		if err != nil {
+			t.Errorf("empty beads dir should allow init, got: %v", err)
+		}
+	})
+}
+
+// GH#2363: Regression — AI agent followed "bd init --force" suggestion and wiped DB.
+// Ensure the message never suggests --force as an actionable command.
+func TestInitGuardServerMessage_NoForceAsAction(t *testing.T) {
+	err := initGuardServerMessage("test_beads", "127.0.0.1", 3307, "test", "")
+	msg := err.Error()
+
+	// The message should mention --force only in the caution/warning section,
+	// never as a suggested command to run.
+	if strings.Contains(msg, "bd init --force --prefix") {
+		t.Errorf("message must NOT suggest 'bd init --force --prefix' as an action:\n%s", msg)
+	}
+	if strings.Contains(msg, "bd init --force to") {
+		t.Errorf("message must NOT suggest 'bd init --force to ...' as an action:\n%s", msg)
+	}
+}
+
+// GH#2338, GH#2327: Regression — error messages must always include enough
+// context to identify the active target (host, port, DB name).
+func TestInitGuardServerMessage_IncludesTargetIdentity(t *testing.T) {
+	err := initGuardServerMessage("custom_db", "10.0.0.5", 3309, "custom", "")
+	msg := err.Error()
+
+	for _, want := range []string{"custom_db", "10.0.0.5", "3309"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message must include target identity %q, got:\n%s", want, msg)
+		}
+	}
+}
+
+// GH#1111: Regression — safe recovery paths must be suggested before destructive ones.
+// Verify that diagnostic commands appear before any mention of --force.
+func TestInitGuardServerMessage_DiagnosticsBeforeForce(t *testing.T) {
+	err := initGuardServerMessage("test_beads", "127.0.0.1", 3307, "test", "")
+	msg := err.Error()
+
+	doctorIdx := strings.Index(msg, "bd doctor")
+	forceIdx := strings.Index(msg, "--force")
+
+	if doctorIdx == -1 {
+		t.Fatal("message must contain 'bd doctor'")
+	}
+	if forceIdx == -1 {
+		t.Fatal("message must contain '--force' (in caution section)")
+	}
+	if doctorIdx > forceIdx {
+		t.Errorf("'bd doctor' (at %d) must appear before '--force' (at %d) in message:\n%s",
+			doctorIdx, forceIdx, msg)
+	}
 }

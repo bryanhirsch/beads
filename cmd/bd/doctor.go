@@ -202,6 +202,16 @@ Examples:
 			FatalError("failed to resolve path: %v", err)
 		}
 
+		// Guardrail: never run mutating bd doctor fix from Gas Town town root.
+		// Town-level repair must go through `gt doctor --fix` because town roots
+		// have additional invariants beyond beads-only repos.
+		if doctorFix && isGasTownTownRoot(absPath) {
+			FatalErrorWithHint(
+				"refusing to run 'bd doctor --fix' at Gas Town town root",
+				"Use 'gt doctor --fix' from town root, or run 'bd doctor --fix' inside a specific rig clone (e.g. <rig>/mayor/rig)",
+			)
+		}
+
 		// Run performance diagnostics if --perf flag is set
 		if perfMode {
 			if err := doctor.RunPerformanceDiagnostics(absPath); err != nil {
@@ -378,6 +388,10 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, hooksCheck)
 	// Don't fail overall check for missing hooks, just warn
 
+	// Check for stale .legacy hook sidecars calling removed "bd hook" command (GH#2398)
+	legacyCheck := convertWithCategory(doctor.CheckStaleLegacyHooks(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, legacyCheck)
+
 	// Check git hooks Dolt compatibility (hooks without Dolt check cause errors)
 	doltHooksCheck := convertWithCategory(doctor.CheckGitHooksDoltCompatibility(path), doctor.CategoryGit)
 	result.Checks = append(result.Checks, doltHooksCheck)
@@ -398,14 +412,35 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
+	// Check 1b: Metadata config file (GH#2478)
+	// Must come before database checks since they depend on metadata.json.
+	beadsDir := filepath.Join(path, ".beads")
+	beadsDir = beads.FollowRedirect(beadsDir)
+	configPath := configfile.ConfigPath(beadsDir)
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		metaCheck := doctorCheck{
+			Name:     "Metadata Config",
+			Status:   statusError,
+			Message:  "metadata.json is missing",
+			Fix:      "Run 'bd doctor --fix' to regenerate with defaults, or 'bd init --force'",
+			Category: doctor.CategoryCore,
+		}
+		result.Checks = append(result.Checks, metaCheck)
+		result.OverallOK = false
+	} else {
+		result.Checks = append(result.Checks, doctorCheck{
+			Name:     "Metadata Config",
+			Status:   statusOK,
+			Message:  "metadata.json present",
+			Category: doctor.CategoryCore,
+		})
+	}
+
 	// GH#1981: Run lock health check BEFORE any checks that open embedded
 	// Dolt databases. Earlier checks (CheckDatabaseVersion, CheckSchemaCompatibility,
 	// etc.) create noms LOCK files via flock(); if CheckLockHealth runs after them,
 	// it detects those same-process locks as "held by another process" (false positive).
 	earlyLockCheck := doctor.CheckLockHealth(path)
-
-	beadsDir := filepath.Join(path, ".beads")
-	beadsDir = beads.FollowRedirect(beadsDir)
 
 	// bd-jgxi: Auto-migrate database version before checking it.
 	// Since doctor skips PersistentPreRun DB init (it's in noDbCommands),
@@ -488,6 +523,13 @@ func runDiagnostics(path string) doctorResult {
 	configValuesCheck := convertWithCategory(doctor.CheckConfigValues(path), doctor.CategoryData)
 	result.Checks = append(result.Checks, configValuesCheck)
 	// Don't fail overall check for config value warnings, just warn
+
+	// Check 7a1: Project identity (GH#2372 backfill)
+	projectIDCheck := convertWithCategory(doctor.CheckProjectIdentity(path), doctor.CategoryData)
+	result.Checks = append(result.Checks, projectIDCheck)
+	if projectIDCheck.Status == statusWarning || projectIDCheck.Status == statusError {
+		result.OverallOK = false
+	}
 
 	// Check 7b: Multi-repo custom types discovery (bd-9ji4z)
 	multiRepoTypesCheck := convertWithCategory(doctor.CheckMultiRepoTypes(path), doctor.CategoryData)
@@ -639,6 +681,13 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, lastTouchedTrackingCheck)
 	// Don't fail overall check for last-touched tracking, just warn
 
+	// Check 14h: tracked runtime/sensitive files (GH#2535)
+	trackedRuntimeCheck := convertDoctorCheck(doctor.CheckTrackedRuntimeFiles(path))
+	result.Checks = append(result.Checks, trackedRuntimeCheck)
+	if trackedRuntimeCheck.Status == statusError {
+		result.OverallOK = false // Sensitive files in git is a real problem
+	}
+
 	// Check 15a: Git working tree cleanliness (AGENTS.md hygiene)
 	gitWorkingTreeCheck := convertWithCategory(doctor.CheckGitWorkingTree(path), doctor.CategoryGit)
 	result.Checks = append(result.Checks, gitWorkingTreeCheck)
@@ -669,12 +718,7 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, untrackedCheck)
 	// Don't fail overall check for untracked files, just warn
 
-	// Check 21: Merge artifacts (from bd clean)
-	mergeArtifactsCheck := convertDoctorCheck(doctor.CheckMergeArtifacts(path))
-	result.Checks = append(result.Checks, mergeArtifactsCheck)
-	// Don't fail overall check for merge artifacts, just warn
-
-	// Check 22: Orphaned dependencies (from bd repair-deps, bd validate)
+	// Check 21: Orphaned dependencies (from bd repair-deps, bd validate)
 	orphanedDepsCheck := convertDoctorCheck(doctor.CheckOrphanedDependencies(path))
 	result.Checks = append(result.Checks, orphanedDepsCheck)
 	// Don't fail overall check for orphaned deps, just warn

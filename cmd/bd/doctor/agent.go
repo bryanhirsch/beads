@@ -120,7 +120,6 @@ var agentEnrichers = map[string]enricher{
 	"Test Pollution":               enrichTestPollution,
 	"Orphaned Dependencies":        enrichOrphanedDeps,
 	"Child-Parent Dependencies":    enrichChildParentDeps,
-	"Merge Artifacts":              enrichMergeArtifacts,
 	"Classic Artifacts":            enrichClassicArtifacts,
 	"Embedded Mode Concurrency":    enrichEmbeddedConcurrency,
 	"Pending Migrations":           enrichPendingMigrations,
@@ -411,7 +410,7 @@ func enrichDoltStatus(dc DoctorCheck) agentEnrichment {
 		explanation: fmt.Sprintf("Dolt database status: %s. Reports uncommitted changes, dirty working set, or other Dolt-specific state issues.", dc.Message),
 		observed:    dc.Message + "\n" + dc.Detail,
 		expected:    "Dolt working set is clean (no uncommitted changes)",
-		commands:    []string{"bd sync"},
+		commands:    []string{"bd dolt commit"},
 		sourceFiles: []string{"cmd/bd/doctor/dolt.go:CheckDoltStatus"},
 	}
 }
@@ -493,17 +492,6 @@ func enrichChildParentDeps(dc DoctorCheck) agentEnrichment {
 	}
 }
 
-func enrichMergeArtifacts(dc DoctorCheck) agentEnrichment {
-	return agentEnrichment{
-		severity:    "advisory",
-		explanation: fmt.Sprintf("Merge artifacts found: %s. Git merge markers or backup files from conflict resolution are present in .beads/. These can be safely cleaned up.", dc.Message),
-		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "No merge artifacts in .beads/",
-		commands:    []string{"bd doctor --fix"},
-		sourceFiles: []string{"cmd/bd/doctor/validation.go:CheckMergeArtifacts"},
-	}
-}
-
 func enrichClassicArtifacts(dc DoctorCheck) agentEnrichment {
 	return agentEnrichment{
 		severity:    "advisory",
@@ -543,7 +531,7 @@ func enrichKVSync(dc DoctorCheck) agentEnrichment {
 		explanation: fmt.Sprintf("KV store sync status: %s. The key-value store may be out of sync with the main database.", dc.Message),
 		observed:    dc.Message + "\n" + dc.Detail,
 		expected:    "KV store is in sync with main database",
-		commands:    []string{"bd sync"},
+		commands:    []string{"bd dolt push"},
 		sourceFiles: []string{"cmd/bd/doctor/kv.go:CheckKVSyncStatus"},
 	}
 }

@@ -389,32 +389,6 @@ bd --no-auto-flush --no-auto-import <command>
 
 **When to use:** Sandboxed environments where the Dolt server can't be controlled (permission restrictions), or when auto-detection doesn't trigger.
 
-### Staleness Control
-
-```bash
-# Skip staleness check (emergency escape hatch)
-bd --allow-stale <command>
-
-# Example: access database even if it appears out of sync
-bd --allow-stale ready --json
-bd --allow-stale list --status open --json
-```
-
-**Shows:** `⚠️  Staleness check skipped (--allow-stale), data may be out of sync`
-
-**⚠️ Caution:** May show stale or incomplete data. Use only when stuck and other options fail.
-
-### Force Import
-
-```bash
-# Force metadata update even when DB appears synced
-bd import --force -i .beads/issues.jsonl
-```
-
-**When to use:** `bd import` reports "0 created, 0 updated" but staleness errors persist.
-
-**Shows:** `Metadata updated (database already in sync)`
-
 ### Other Global Flags
 
 ```bash
@@ -493,37 +467,7 @@ bd rename-prefix kw- --json     # Apply rename
 
 ### Import/Export
 
-```bash
-# Import issues from JSONL
-bd import -i .beads/issues.jsonl --dry-run      # Preview changes
-bd import -i .beads/issues.jsonl                # Import and update issues
-bd import -i .beads/issues.jsonl --dedupe-after # Import + detect duplicates
-
-# Handle missing parents during import
-bd import -i issues.jsonl --orphan-handling allow      # Default: import orphans without validation
-bd import -i issues.jsonl --orphan-handling resurrect  # Auto-resurrect deleted parents as tombstones
-bd import -i issues.jsonl --orphan-handling skip       # Skip orphans with warning
-bd import -i issues.jsonl --orphan-handling strict     # Fail if parent is missing
-
-# Configure default orphan handling behavior
-bd config set import.orphan_handling "resurrect"
-bd sync  # Now uses resurrect mode by default
-```
-
-**Orphan handling modes:**
-
-- **`allow` (default)** - Import orphaned children without parent validation. Most permissive, ensures no data loss even if hierarchy is temporarily broken.
-- **`resurrect`** - Search history for deleted parents and recreate them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data. Dependencies are also resurrected on best-effort basis.
-- **`skip`** - Skip orphaned children with warning. Partial import succeeds but some issues are excluded.
-- **`strict`** - Fail import immediately if a child's parent is missing. Use when database integrity is critical.
-
-**When to use:**
-- Use `allow` (default) for daily imports and auto-sync
-- Use `resurrect` when importing from databases with deleted parents
-- Use `strict` for controlled imports requiring guaranteed parent existence
-- Use `skip` rarely - only for selective imports
-
-See [CONFIG.md](CONFIG.md#example-import-orphan-handling) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#import-fails-with-missing-parent-errors) for more details.
+> **Note:** `bd import` has been removed. For JSONL migration, use `bd init <prefix> --from-jsonl <file>`.
 
 ### Migration
 
@@ -557,15 +501,14 @@ These invariants prevent data loss and would have caught issues like GH #201 (mi
 ### Sync Operations
 
 ```bash
-# Manual sync (force immediate export/import/commit/push)
-bd sync
-
-# What it does:
-# 1. Commit pending changes to Dolt
-# 2. Pull from remote
-# 3. Merge any updates
-# 4. Push to remote
+# Sync via Dolt commands
+bd dolt push                   # Push changes to remote
+bd dolt pull                   # Pull from remote
+bd dolt commit                 # Commit pending changes
+bd dolt show                   # Check connection status
 ```
+
+> **Note:** `bd sync` is deprecated (now a no-op). Use the Dolt commands above instead.
 
 ## Issue Types
 
@@ -686,10 +629,10 @@ bd update bd-42 --claim --json
 # ... work ...
 
 # End of session (IMPORTANT!)
-bd sync  # Force immediate sync, bypass debounce
+bd dolt push  # Push changes to remote
 ```
 
-**ALWAYS run `bd sync` at end of agent sessions** to ensure changes are committed/pushed immediately.
+**ALWAYS run `bd dolt push` at end of agent sessions** to ensure changes are pushed to remote.
 
 ## See Also
 

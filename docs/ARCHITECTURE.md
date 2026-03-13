@@ -49,7 +49,7 @@ bd's core design enables a distributed, git-backed issue tracker that feels like
 
 **Dolt for distribution:** Native push/pull to Dolt remotes (DoltHub, S3, GCS). No special sync server needed. Issues travel with your code. Offline work just works.
 
-**Import/export for portability:** `bd import` and `bd export` support JSONL format for data migration, bootstrapping new clones, and interoperability.
+**Export for portability:** `bd export` outputs JSONL format for data migration and interoperability. Use `bd init --from-jsonl` to bootstrap a new database from an export.
 
 ## Write Path
 
@@ -115,18 +115,18 @@ Branch B: bd create "Add Stripe"  → bd-f14c (no collision)
 1. **Issue creation:** Generate random UUID, derive short hash as ID
 2. **Progressive scaling:** IDs start at 4 chars, grow to 5-6 chars as database grows
 3. **Content hashing:** Each issue has a content hash for change detection
-4. **Import merge:** Same ID + different content = update, same ID + same content = skip
+4. **Merge logic:** Same ID + different content = update, same ID + same content = skip
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Import Logic                              │
-│                  (used by bd import for migration)               │
+│                        Merge Logic                               │
+│             (used by Dolt pull and init --from-jsonl)            │
 │                                                                  │
-│  For each issue in import data:                                  │
+│  For each issue in incoming data:                                │
 │    1. Compute content hash                                       │
 │    2. Look up existing issue by ID                               │
 │    3. Compare hashes:                                            │
-│       - Same hash → skip (already imported)                      │
+│       - Same hash → skip (already present)                       │
 │       - Different hash → update (newer version)                  │
 │       - No match → create (new issue)                            │
 └─────────────────────────────────────────────────────────────────┘
@@ -165,8 +165,11 @@ Each workspace can run its own Dolt server for multi-writer access:
 
 **Server mode:**
 - Connects to `dolt sql-server` (multi-writer, high-concurrency)
-- PID file at `.beads/dolt/sql-server.pid`
-- Logs at `.beads/dolt/sql-server.log`
+- PID file at `.beads/dolt-server.pid`
+- Logs at `.beads/dolt-server.log`
+- **Shared server mode** (opt-in): all projects share a single Dolt server at
+  `~/.beads/shared-server/` instead of per-project servers. Enable via
+  `dolt.shared-server: true` in config.yaml or `BEADS_DOLT_SHARED_SERVER=1`.
 
 **Embedded mode:**
 - Direct database access (single-writer, no server process)

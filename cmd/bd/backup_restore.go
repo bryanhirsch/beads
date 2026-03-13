@@ -61,6 +61,11 @@ To initialize and restore in one step, use: bd init && bd backup restore`,
 			return fmt.Errorf("no issues.jsonl found in %s\nThis doesn't look like a valid backup directory", dir)
 		}
 
+		// Validate schema of issues.jsonl before proceeding (GH#2492)
+		if err := validateIssueJSONLSchema(issuesPath); err != nil {
+			return fmt.Errorf("backup validation failed: %w", err)
+		}
+
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 
 		result, err := runBackupRestore(ctx, store, dir, dryRun)
@@ -102,13 +107,15 @@ func init() {
 
 // restoreResult tracks what a restore operation did.
 type restoreResult struct {
-	Issues       int `json:"issues"`
-	Comments     int `json:"comments"`
-	Dependencies int `json:"dependencies"`
-	Labels       int `json:"labels"`
-	Events       int `json:"events"`
-	Config       int `json:"config"`
-	Warnings     int `json:"warnings"`
+	Issues       int      `json:"issues"`
+	Comments     int      `json:"comments"`
+	Dependencies int      `json:"dependencies"`
+	Labels       int      `json:"labels"`
+	Events       int      `json:"events"`
+	Config       int      `json:"config"`
+	Warnings     int      `json:"warnings"`
+	Errors       int      `json:"errors"`
+	ErrorDetails []string `json:"error_details,omitempty"`
 }
 
 // runBackupRestore imports all JSONL backup tables into the Dolt store.
@@ -232,6 +239,9 @@ func restoreConfig(ctx context.Context, s *dolt.DoltStore, path string, dryRun b
 // Uses raw SQL with dynamic columns to match the backup export format exactly,
 // avoiding type mismatches between DB values (e.g., int 0/1 for booleans) and
 // Go struct types.
+//
+// The JSONL may contain denormalized data from `bd export` (labels, dependencies,
+// comment counts). These are extracted and inserted into their proper tables.
 func restoreIssues(ctx context.Context, s *dolt.DoltStore, path string, dryRun bool) (int, error) {
 	lines, err := readJSONLFile(path)
 	if err != nil {
@@ -270,15 +280,82 @@ func restoreIssues(ctx context.Context, s *dolt.DoltStore, path string, dryRun b
 			continue
 		}
 
+		issueID, _ := row["id"].(string)
+
+		// Extract denormalized relational data before SQL insertion.
+		// `bd export` embeds labels ([]string) and dependencies ([]*Dependency)
+		// in each issue row, but they belong in separate tables.
+		var labels []interface{}
+		if v, ok := row["labels"]; ok {
+			if arr, ok := v.([]interface{}); ok {
+				labels = arr
+			}
+			delete(row, "labels")
+		}
+
+		var deps []interface{}
+		if v, ok := row["dependencies"]; ok {
+			if arr, ok := v.([]interface{}); ok {
+				deps = arr
+			}
+			delete(row, "dependencies")
+		}
+
+		// Remove computed count fields that don't exist in the issues table.
+		delete(row, "dependency_count")
+		delete(row, "dependent_count")
+		delete(row, "comment_count")
+		delete(row, "parent")
+
 		n, warnings := restoreTableRow(ctx, db, "issues", row)
 		count += n
 		_ = warnings
+
+		if n == 0 {
+			continue // insertion failed, skip relational data
+		}
+
+		// Insert extracted labels into the labels table
+		for _, l := range labels {
+			if label, ok := l.(string); ok && label != "" {
+				_, _ = db.ExecContext(ctx,
+					"INSERT IGNORE INTO labels (issue_id, label) VALUES (?, ?)",
+					issueID, label)
+			}
+		}
+
+		// Insert extracted dependencies into the dependencies table
+		for _, d := range deps {
+			dep, ok := d.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			depIssueID, _ := dep["issue_id"].(string)
+			dependsOnID, _ := dep["depends_on_id"].(string)
+			depType, _ := dep["type"].(string)
+			createdBy, _ := dep["created_by"].(string)
+			metadata, _ := dep["metadata"].(string)
+			if metadata == "" {
+				metadata = "{}"
+			}
+			if depIssueID == "" || dependsOnID == "" {
+				continue
+			}
+			createdAtStr, _ := dep["created_at"].(string)
+			createdAt := parseTimeOrNow(createdAtStr)
+			_, _ = db.ExecContext(ctx,
+				"INSERT IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+				depIssueID, dependsOnID, depType, createdAt, createdBy, metadata)
+		}
 	}
 	return count, nil
 }
 
 // restoreTableRow inserts a single row from a JSONL map into the given table.
 // Uses INSERT IGNORE to handle duplicates gracefully. Returns (1, 0) on success.
+//
+// Values that are slices ([]interface{}) are serialized to JSON strings before
+// insertion, since the SQL driver cannot handle Go slice types directly.
 func restoreTableRow(ctx context.Context, db *sql.DB, table string, row map[string]interface{}) (int, int) {
 	if len(row) == 0 {
 		return 0, 0
@@ -289,6 +366,22 @@ func restoreTableRow(ctx context.Context, db *sql.DB, table string, row map[stri
 	placeholders := make([]string, 0, len(row))
 
 	for col, val := range row {
+		// Convert slice/map types that the SQL driver cannot handle directly.
+		// These typically come from JSON arrays or nested objects in the JSONL.
+		switch v := val.(type) {
+		case []interface{}:
+			serialized, err := json.Marshal(v)
+			if err != nil {
+				continue // skip unparseable values
+			}
+			val = string(serialized)
+		case map[string]interface{}:
+			serialized, err := json.Marshal(v)
+			if err != nil {
+				continue
+			}
+			val = string(serialized)
+		}
 		cols = append(cols, "`"+col+"`")
 		placeholders = append(placeholders, "?")
 		vals = append(vals, val)
@@ -361,11 +454,12 @@ func restoreDependencies(ctx context.Context, db *sql.DB, path string, dryRun bo
 	warnings := 0
 	for _, line := range lines {
 		var dep struct {
-			IssueID     string `json:"issue_id"`
-			DependsOnID string `json:"depends_on_id"`
-			Type        string `json:"type"`
-			CreatedAt   string `json:"created_at"`
-			CreatedBy   string `json:"created_by"`
+			IssueID     string  `json:"issue_id"`
+			DependsOnID string  `json:"depends_on_id"`
+			Type        string  `json:"type"`
+			CreatedAt   string  `json:"created_at"`
+			CreatedBy   string  `json:"created_by"`
+			Metadata    *string `json:"metadata"`
 		}
 		if err := json.Unmarshal(line, &dep); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: skipping invalid dependency line: %v\n", err)
@@ -377,10 +471,22 @@ func restoreDependencies(ctx context.Context, db *sql.DB, path string, dryRun bo
 		}
 		if !dryRun {
 			createdAt := parseTimeOrNow(dep.CreatedAt)
+			meta := "{}"
+			if dep.Metadata != nil {
+				raw := strings.TrimSpace(*dep.Metadata)
+				if raw != "" {
+					if !json.Valid([]byte(raw)) {
+						fmt.Fprintf(os.Stderr, "Warning: invalid dependency metadata for %s -> %s; defaulting to {}\n", dep.IssueID, dep.DependsOnID)
+						warnings++
+					} else {
+						meta = raw
+					}
+				}
+			}
 			_, err := db.ExecContext(ctx, `
 				INSERT IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
-				VALUES (?, ?, ?, ?, ?, '{}')
-			`, dep.IssueID, dep.DependsOnID, dep.Type, createdAt, dep.CreatedBy)
+				VALUES (?, ?, ?, ?, ?, ?)
+			`, dep.IssueID, dep.DependsOnID, dep.Type, createdAt, dep.CreatedBy, meta)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to restore dependency %s -> %s: %v\n", dep.IssueID, dep.DependsOnID, err)
 				warnings++
@@ -501,6 +607,51 @@ func readJSONLFile(path string) ([]json.RawMessage, error) {
 		return nil, fmt.Errorf("failed to scan %s: %w", path, err)
 	}
 	return lines, nil
+}
+
+// validateIssueJSONLSchema checks the first line of a JSONL file to verify it
+// contains expected issue fields. This prevents silent data corruption from
+// importing export files with incompatible schemas (GH#2492, GH#2465).
+//
+// Returns nil if the schema looks valid, or an error describing the mismatch.
+func validateIssueJSONLSchema(path string) error {
+	f, err := os.Open(path) //nolint:gosec // path is from trusted backup directory, not user-controlled
+	if err != nil {
+		return fmt.Errorf("cannot open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
+	if !scanner.Scan() {
+		return nil // Empty file, nothing to validate
+	}
+
+	line := scanner.Bytes()
+	if len(line) == 0 {
+		return nil
+	}
+
+	// Parse first line as JSON object
+	var firstRow map[string]interface{}
+	if err := json.Unmarshal(line, &firstRow); err != nil {
+		return fmt.Errorf("first line of %s is not valid JSON: %w", path, err)
+	}
+
+	// Check for required issue fields
+	requiredFields := []string{"id", "title", "status"}
+	var missing []string
+	for _, field := range requiredFields {
+		if _, ok := firstRow[field]; !ok {
+			missing = append(missing, field)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("issues.jsonl schema mismatch: missing required fields %v in first row. This file may be a bd export (different format) or corrupted", missing)
+	}
+
+	return nil
 }
 
 // parseTimeOrNow parses an RFC3339 time string, returning now if parsing fails.

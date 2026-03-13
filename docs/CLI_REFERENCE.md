@@ -295,32 +295,6 @@ bd --sandbox <command>
 
 **When to use:** Sandboxed environments where the Dolt server can't be controlled (permission restrictions), or when auto-detection doesn't trigger.
 
-### Staleness Control
-
-```bash
-# Skip staleness check (emergency escape hatch)
-bd --allow-stale <command>
-
-# Example: access database even if it appears out of sync
-bd --allow-stale ready --json
-bd --allow-stale list --status open --json
-```
-
-**Shows:** `⚠️  Staleness check skipped (--allow-stale), data may be out of sync`
-
-**⚠️ Caution:** May show stale or incomplete data. Use only when stuck and other options fail.
-
-### Force Import
-
-```bash
-# Force metadata update even when DB appears synced
-bd import --force -i .beads/issues.jsonl
-```
-
-**When to use:** `bd import` reports "0 created, 0 updated" but staleness errors persist.
-
-**Shows:** `Metadata updated (database already in sync)`
-
 ### Other Global Flags
 
 ```bash
@@ -587,37 +561,26 @@ bd gate add-waiter <gate-id> <waiter>
 
 ## Database Management
 
-### Import/Export
+### Export / Bootstrap
 
 ```bash
-# Import issues from JSONL
-bd import -i .beads/issues.jsonl --dry-run      # Preview changes
-bd import -i .beads/issues.jsonl                # Import and update issues
-bd import -i .beads/issues.jsonl --dedupe-after # Import + detect duplicates
+# Export issues to JSONL
+bd export -o issues.jsonl
 
-# Handle missing parents during import
-bd import -i issues.jsonl --orphan-handling allow      # Default: import orphans without validation
-bd import -i issues.jsonl --orphan-handling resurrect  # Auto-resurrect deleted parents as tombstones
-bd import -i issues.jsonl --orphan-handling skip       # Skip orphans with warning
-bd import -i issues.jsonl --orphan-handling strict     # Fail if parent is missing
+# Bootstrap a new database from an export
+bd init --from-jsonl                            # Reads .beads/issues.jsonl
 
-# Configure default orphan handling behavior
+# Configure orphan handling for pulls and bootstrapping
 bd config set import.orphan_handling "resurrect"
-bd sync  # Now uses resurrect mode by default
+bd dolt pull  # Respects import.orphan_handling setting
 ```
 
-**Orphan handling modes:**
+**Orphan handling modes** (apply to `bd dolt pull` and `bd init --from-jsonl`):
 
 - **`allow` (default)** - Import orphaned children without parent validation. Most permissive, ensures no data loss even if hierarchy is temporarily broken.
-- **`resurrect`** - Search JSONL history for deleted parents and recreate them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data. Dependencies are also resurrected on best-effort basis.
+- **`resurrect`** - Search for deleted parents and recreate them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data.
 - **`skip`** - Skip orphaned children with warning. Partial import succeeds but some issues are excluded.
-- **`strict`** - Fail import immediately if a child's parent is missing. Use when database integrity is critical.
-
-**When to use:**
-- Use `allow` (default) for daily imports and auto-sync
-- Use `resurrect` when importing from databases with deleted parents
-- Use `strict` for controlled imports requiring guaranteed parent existence
-- Use `skip` rarely - only for selective imports
+- **`strict`** - Fail immediately if a child's parent is missing. Use when database integrity is critical.
 
 See [CONFIG.md](CONFIG.md#example-import-orphan-handling) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#import-fails-with-missing-parent-errors) for more details.
 
@@ -685,7 +648,7 @@ bd migrate sync beads-sync --orphan                    # Delete and recreate as 
 
 **After setup:**
 
-- `bd sync` commits beads changes to the sync branch via worktree
+- `bd dolt push` commits beads changes to the sync branch via worktree
 - Your working branch stays clean of beads commits
 - Essential for multi-clone setups where clones work independently
 
@@ -698,14 +661,15 @@ bd migrate sync beads-sync --orphan                    # Delete and recreate as 
 ### Sync Operations
 
 ```bash
-# Manual sync (force immediate commit/push)
-bd sync
+# Manual sync (push changes to remote)
+bd dolt push
 
-# What it does:
-# 1. Commit pending changes to Dolt
-# 2. Pull from remote
-# 3. Merge any updates
-# 4. Push to remote
+# Pull changes from remote
+bd dolt pull
+
+# What these do:
+# bd dolt push - Commit pending changes to Dolt and push to remote
+# bd dolt pull - Pull from remote and merge any updates
 ```
 
 ### Key-Value Store
@@ -884,10 +848,10 @@ bd update bd-42 --claim --json
 # ... work ...
 
 # End of session (IMPORTANT!)
-bd sync  # Force immediate sync, bypass debounce
+bd dolt push  # Force immediate sync, bypass debounce
 ```
 
-**ALWAYS run `bd sync` at end of agent sessions** to ensure changes are committed/pushed immediately.
+**ALWAYS run `bd dolt push` at end of agent sessions** to ensure changes are committed/pushed immediately.
 
 ## Editor Integration
 

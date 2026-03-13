@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -261,6 +262,167 @@ func countWispDependencyRows(t *testing.T, ctx context.Context, db *sql.DB, ids 
 		t.Fatalf("countWispDependencyRows: %v", err)
 	}
 	return count
+}
+
+// TestRunInTransaction_DoesNotCorruptConfig verifies that RunInTransaction
+// does not sweep up unrelated config table changes when committing.
+// This is the regression test for GH#2455: wisp GC/burn was corrupting
+// issue_prefix because DOLT_COMMIT('-Am') staged ALL dirty tables, including
+// config changes from concurrent operations. The fix uses explicit DOLT_ADD
+// for only the tables modified by the transaction.
+func TestRunInTransaction_DoesNotCorruptConfig(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Set the canonical issue_prefix and create an issue BEFORE corrupting config.
+	// CreateIssue has its own DOLT_COMMIT, so we must set up the issue first.
+	// Use CommitWithConfig since we're intentionally modifying config.
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	if err := store.CommitWithConfig(ctx, "set prefix"); err != nil {
+		t.Fatalf("CommitWithConfig: %v", err)
+	}
+
+	issue := &types.Issue{
+		Title:     "test issue for GH#2455",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	// Verify HEAD has "test" as the committed prefix
+	var headPrefix string
+	err := store.db.QueryRowContext(ctx,
+		"SELECT value FROM config AS OF 'HEAD' WHERE `key` = 'issue_prefix'").Scan(&headPrefix)
+	if err != nil {
+		t.Fatalf("query HEAD prefix: %v", err)
+	}
+	t.Logf("HEAD prefix after CreateIssue: %q", headPrefix)
+	if headPrefix != "test" {
+		t.Fatalf("precondition failed: HEAD prefix = %q, want %q", headPrefix, "test")
+	}
+
+	// NOW simulate a stale working set change: another operation modified
+	// issue_prefix but didn't DOLT_COMMIT. This leaves the config table
+	// dirty in the working set.
+	_, err = store.db.ExecContext(ctx, "UPDATE config SET value = 'CORRUPTED' WHERE `key` = 'issue_prefix'")
+	if err != nil {
+		t.Fatalf("simulate stale config change: %v", err)
+	}
+
+	// Delete the issue via RunInTransaction. The old code would use
+	// DOLT_COMMIT('-Am') which would sweep up the stale config change.
+	err = store.RunInTransaction(ctx, "test: delete issue", func(tx storage.Transaction) error {
+		return tx.DeleteIssue(ctx, issue.ID)
+	})
+	if err != nil {
+		t.Fatalf("RunInTransaction: %v", err)
+	}
+
+	// Verify issue_prefix was NOT corrupted by the transaction's DOLT_COMMIT.
+	// With the old -Am approach, this would read "CORRUPTED".
+	// With the fix (explicit DOLT_ADD), config is not staged, so the
+	// committed value remains "test".
+	var committedPrefix string
+	err = store.db.QueryRowContext(ctx,
+		"SELECT value FROM config AS OF 'HEAD' WHERE `key` = 'issue_prefix'").Scan(&committedPrefix)
+	if err != nil {
+		t.Fatalf("query committed prefix: %v", err)
+	}
+	if committedPrefix != "test" {
+		t.Errorf("GH#2455 regression: committed issue_prefix = %q, want %q", committedPrefix, "test")
+	}
+}
+
+// TestCommit_ExcludesConfig verifies that s.Commit() does NOT stage the config
+// table, preventing stale issue_prefix changes from being swept into commits.
+// This is the core fix for GH#2455: Commit() now stages all dirty tables
+// EXCEPT config. Config is only committed by CommitWithConfig (used by
+// CommitPending for explicit 'bd dolt commit').
+func TestCommit_ExcludesConfig(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Set and commit a known-good prefix via CommitWithConfig
+	if err := store.SetConfig(ctx, "issue_prefix", "correct"); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	if err := store.CommitWithConfig(ctx, "set correct prefix"); err != nil {
+		t.Fatalf("CommitWithConfig: %v", err)
+	}
+
+	// Simulate stale corruption: another operation modified issue_prefix in
+	// the working set without DOLT_COMMIT'ing. The working set now has a
+	// WRONG value while HEAD still has "correct".
+	_, err := store.db.ExecContext(ctx, "UPDATE config SET value = 'WRONG' WHERE `key` = 'issue_prefix'")
+	if err != nil {
+		t.Fatalf("simulate stale config change: %v", err)
+	}
+
+	// Also dirty a real table so Commit() has something to commit.
+	_, err = store.db.ExecContext(ctx, "INSERT INTO metadata (`key`, value) VALUES ('_gh2455_test', 'v') ON DUPLICATE KEY UPDATE value = 'v'")
+	if err != nil {
+		t.Fatalf("insert metadata: %v", err)
+	}
+
+	// Call s.Commit() — the general-purpose path. With the old '-Am'
+	// approach, this would stage ALL dirty tables including config,
+	// committing the "WRONG" value. With the fix, Commit() skips config
+	// entirely, so the committed issue_prefix remains "correct".
+	if err := store.Commit(ctx, "test commit that should skip config"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Verify issue_prefix was NOT corrupted — HEAD should still have "correct".
+	var committedPrefix string
+	err = store.db.QueryRowContext(ctx,
+		"SELECT value FROM config AS OF 'HEAD' WHERE `key` = 'issue_prefix'").Scan(&committedPrefix)
+	if err != nil {
+		t.Fatalf("query HEAD prefix: %v", err)
+	}
+	if committedPrefix != "correct" {
+		t.Errorf("GH#2455 regression: HEAD issue_prefix = %q, want %q", committedPrefix, "correct")
+	}
+}
+
+// TestCommitWithConfig_IncludesConfig verifies that CommitWithConfig DOES
+// commit config changes. This is used by CommitPending (bd dolt commit)
+// when the user intentionally modified config.
+func TestCommitWithConfig_IncludesConfig(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Change issue_prefix and commit with CommitWithConfig (intentional change)
+	if err := store.SetConfig(ctx, "issue_prefix", "newprefix"); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	if err := store.CommitWithConfig(ctx, "intentional prefix change"); err != nil {
+		t.Fatalf("CommitWithConfig: %v", err)
+	}
+
+	// Verify the intentional change was committed
+	var committedPrefix string
+	err := store.db.QueryRowContext(ctx,
+		"SELECT value FROM config AS OF 'HEAD' WHERE `key` = 'issue_prefix'").Scan(&committedPrefix)
+	if err != nil {
+		t.Fatalf("query HEAD prefix: %v", err)
+	}
+	if committedPrefix != "newprefix" {
+		t.Errorf("CommitWithConfig should include config: HEAD issue_prefix = %q, want %q", committedPrefix, "newprefix")
+	}
 }
 
 // TestFindWispDependentsRecursive_NoDependents verifies wisps with no

@@ -118,9 +118,15 @@ func (s *DoltStore) CreateIssue(ctx context.Context, issue *types.Issue, actor s
 		return fmt.Errorf("failed to record creation event: %w", err)
 	}
 
-	// DOLT_COMMIT inside transaction — atomic with the writes
+	// GH#2455: Stage only the tables we modified, then commit without -A
+	// to avoid sweeping up stale config changes from concurrent operations.
+	for _, table := range []string{"issues", "events"} {
+		if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
+			return fmt.Errorf("dolt add %s: %w", table, err)
+		}
+	}
 	commitMsg := fmt.Sprintf("bd: create %s", issue.ID)
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("dolt commit: %w", err)
 	}
@@ -390,9 +396,12 @@ func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*t
 		}
 	}
 
-	// DOLT_COMMIT inside transaction — atomic with the writes
+	// GH#2455: Stage only the tables we modified, then commit without -A.
+	for _, table := range []string{"issues", "events", "dependencies", "child_counters"} {
+		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+	}
 	commitMsg := fmt.Sprintf("bd: create %d issue(s)", len(issues))
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("dolt commit: %w", err)
 	}
@@ -543,6 +552,19 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 		}
 	}
 
+	// Auto-clear pinned column when status transitions away from "pinned".
+	// The legacy pinned=1 column can cause beads to be invisible to bd list
+	// when combined with non-pinned statuses (e.g., hooked). Clear it on
+	// any status transition away from pinned to prevent stale flag issues.
+	if newStatus, ok := updates["status"]; ok {
+		if oldIssue.Pinned && newStatus != "pinned" {
+			if _, alreadySet := updates["pinned"]; !alreadySet {
+				setClauses = append(setClauses, "`pinned` = ?")
+				args = append(args, false)
+			}
+		}
+	}
+
 	// Auto-manage closed_at
 	setClauses, args = manageClosedAt(oldIssue, updates, setClauses, args)
 
@@ -563,9 +585,12 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 		return fmt.Errorf("failed to record event: %w", err)
 	}
 
-	// DOLT_COMMIT inside transaction — atomic with the writes
+	// GH#2455: Stage only the tables we modified, then commit without -A.
+	for _, table := range []string{"issues", "events"} {
+		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+	}
 	commitMsg := fmt.Sprintf("bd: update %s", id)
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("dolt commit: %w", err)
 	}
@@ -641,9 +666,12 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 		return fmt.Errorf("failed to record claim event: %w", err)
 	}
 
-	// DOLT_COMMIT inside transaction — atomic with the writes
+	// GH#2455: Stage only the tables we modified, then commit without -A.
+	for _, table := range []string{"issues", "events"} {
+		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+	}
 	commitMsg := fmt.Sprintf("bd: claim %s", id)
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("dolt commit: %w", err)
 	}
@@ -691,9 +719,12 @@ func (s *DoltStore) CloseIssue(ctx context.Context, id string, reason string, ac
 		return fmt.Errorf("failed to record event: %w", err)
 	}
 
-	// DOLT_COMMIT inside transaction — atomic with the writes
+	// GH#2455: Stage only the tables we modified, then commit without -A.
+	for _, table := range []string{"issues", "events"} {
+		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+	}
 	commitMsg := fmt.Sprintf("bd: close %s", id)
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("dolt commit: %w", err)
 	}
@@ -750,9 +781,12 @@ func (s *DoltStore) DeleteIssue(ctx context.Context, id string) error {
 		return fmt.Errorf("issue not found: %s", id)
 	}
 
-	// DOLT_COMMIT inside transaction — atomic with the writes
+	// GH#2455: Stage only the tables we modified, then commit without -A.
+	for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
+		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+	}
 	commitMsg := fmt.Sprintf("bd: delete %s", id)
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("dolt commit: %w", err)
 	}
@@ -1011,9 +1045,14 @@ func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool
 	}
 	result.DeletedCount = totalDeleted + wispDeleteCount
 
-	// DOLT_COMMIT inside transaction — atomic with the writes
+	// GH#2455: Stage only the tables this operation modified, then commit
+	// without -A. The old '-Am' approach staged ALL dirty tables in the
+	// working set, sweeping up stale config changes from concurrent operations.
+	for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
+		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+	}
 	commitMsg := fmt.Sprintf("bd: delete %d issue(s)", totalDeleted)
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return nil, fmt.Errorf("dolt commit: %w", err)
 	}

@@ -10,12 +10,12 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
 // runContributorWizard guides the user through OSS contributor setup
-func runContributorWizard(ctx context.Context, store *dolt.DoltStore) error {
+func runContributorWizard(ctx context.Context, store storage.DoltStorage) error {
 	fmt.Printf("\n%s %s\n\n", ui.RenderBold("bd"), ui.RenderBold("Contributor Workflow Setup Wizard"))
 	fmt.Println("This wizard will configure beads for OSS contribution.")
 	fmt.Println()
@@ -236,7 +236,7 @@ Created by: bd init --contributor
 	fmt.Println("  Issues from planning repo will appear in 'bd list'")
 
 	// If this is a fork, configure sync to pull beads from upstream (bd-bx9)
-	// This ensures `bd sync` gets the latest issues from the source repo,
+	// This ensures `bd dolt pull` gets the latest issues from the source repo,
 	// not from the fork's potentially outdated origin/main
 	if isFork {
 		if err := store.SetConfig(ctx, "sync.remote", "upstream"); err != nil {

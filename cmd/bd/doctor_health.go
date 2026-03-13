@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -35,9 +36,18 @@ func runCheckHealth(path string) {
 		return
 	}
 
-	// Try connecting to Dolt server for config/version checks
+	// Try connecting to Dolt server for config/version checks.
+	// Use doltserver.DefaultConfig for port resolution — GetDoltServerPort
+	// falls back to 3307 which is wrong for ephemeral ports.
 	host := cfg.GetDoltServerHost()
-	port := cfg.GetDoltServerPort()
+	port := doltserver.DefaultConfig(beadsDir).Port
+	if port == 0 {
+		// No server running yet — skip DB checks, only check hooks.
+		if issue := doctor.CheckHooksQuick(Version); issue != "" {
+			printCheckHealthHint([]string{issue})
+		}
+		return
+	}
 	database := cfg.GetDoltDatabase()
 
 	var issues []string
@@ -200,7 +210,7 @@ func printCheckHealthHint(issues []string) {
 // Used by runCheckHealth to avoid multiple DB opens.
 func hintsDisabledDB(db *sql.DB) bool {
 	var value string
-	err := db.QueryRow("SELECT value FROM config WHERE key = ?", ConfigKeyHintsDoctor).Scan(&value)
+	err := db.QueryRow("SELECT value FROM config WHERE `key` = ?", ConfigKeyHintsDoctor).Scan(&value)
 	if err != nil {
 		return false // Key not set, assume hints enabled
 	}
@@ -211,7 +221,7 @@ func hintsDisabledDB(db *sql.DB) bool {
 // Uses an existing DB connection.
 func checkVersionMismatchDB(db *sql.DB) string {
 	var dbVersion string
-	err := db.QueryRow("SELECT value FROM metadata WHERE key = 'bd_version'").Scan(&dbVersion)
+	err := db.QueryRow("SELECT value FROM metadata WHERE `key` = 'bd_version'").Scan(&dbVersion)
 	if err != nil {
 		return "" // Can't read version, skip
 	}

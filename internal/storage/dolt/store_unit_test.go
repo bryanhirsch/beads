@@ -19,6 +19,8 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 	if testServerPort == 0 {
 		t.Skip("Test Dolt server not running, skipping test")
 	}
+	acquireTestSlot()
+	t.Cleanup(releaseTestSlot)
 
 	dbName := uniqueTestDBName(t)
 
@@ -41,11 +43,8 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 
 	return db, func() {
 		db.Close()
-		cleanup, cErr := sql.Open("mysql", adminDSN)
-		if cErr == nil {
-			cleanup.Exec("DROP DATABASE IF EXISTS `" + dbName + "`")
-			cleanup.Close()
-		}
+		// Skip DROP DATABASE — rapid CREATE/DROP cycles crash the Dolt container.
+		// Orphan databases are cleaned up when the container terminates.
 	}
 }
 
@@ -320,7 +319,8 @@ func TestApplyConfigDefaults_EnvOverridesConfig(t *testing.T) {
 }
 
 // TestApplyConfigDefaults_ProductionFallback verifies that without
-// BEADS_TEST_MODE, ServerPort falls back to DefaultSQLPort normally.
+// BEADS_TEST_MODE and no env port, ServerPort stays 0 (ephemeral).
+// Auto-start (EnsureRunning) will allocate the port at connection time.
 func TestApplyConfigDefaults_ProductionFallback(t *testing.T) {
 	origTestMode := os.Getenv("BEADS_TEST_MODE")
 	origPort := os.Getenv("BEADS_DOLT_PORT")
@@ -343,8 +343,8 @@ func TestApplyConfigDefaults_ProductionFallback(t *testing.T) {
 	cfg := &Config{}
 	applyConfigDefaults(cfg)
 
-	if cfg.ServerPort != DefaultSQLPort {
-		t.Errorf("expected ServerPort=%d (DefaultSQLPort), got %d", DefaultSQLPort, cfg.ServerPort)
+	if cfg.ServerPort != 0 {
+		t.Errorf("expected ServerPort=0 (ephemeral, resolved by auto-start), got %d", cfg.ServerPort)
 	}
 }
 

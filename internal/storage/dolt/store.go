@@ -68,6 +68,9 @@ func isTestDatabaseName(name string) bool {
 	return false
 }
 
+// Compile-time interface check.
+var _ storage.DoltStorage = (*DoltStore)(nil)
+
 // DoltStore implements the Storage interface using Dolt
 type DoltStore struct {
 	db            *sql.DB
@@ -514,10 +517,13 @@ func applyConfigDefaults(cfg *Config) {
 		if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
 			cfg.ServerPort = p
 		}
-	} else if cfg.ServerPort == 0 {
-		cfg.ServerPort = DefaultSQLPort
 	}
-	// Test mode guard: if we'd hit production, force port 1 instead.
+	// Port 0 means "not yet resolved" — auto-start (EnsureRunning) will
+	// allocate an ephemeral port. Don't default to 3307 as that caused
+	// cross-project data leakage (GH#2098, GH#2372).
+	//
+	// Test mode guard: force port 1 (immediate fail) if we'd hit production
+	// or have no port, to prevent test databases leaking onto production.
 	if os.Getenv("BEADS_TEST_MODE") == "1" {
 		if cfg.ServerPort == 0 || cfg.ServerPort == DefaultSQLPort {
 			cfg.ServerPort = 1
@@ -593,8 +599,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 					"To disable auto-start: set dolt.auto-start: false in .beads/config.yaml",
 					addr, startErr)
 			}
-			// Update port in case EnsureRunning used a derived port
+			// Update port — EnsureRunning allocates an ephemeral port
 			if port != cfg.ServerPort {
+				if cfg.ServerPort > 0 {
+					fmt.Fprintf(os.Stderr, "Warning: Dolt server endpoint changed: port %d → %d (auto-start)\n", cfg.ServerPort, port)
+					fmt.Fprintf(os.Stderr, "  Previous port was unreachable. If other tools expect port %d, they may see stale data.\n", cfg.ServerPort)
+					fmt.Fprintf(os.Stderr, "  To pin a port: set dolt.port in .beads/config.yaml\n")
+				}
 				cfg.ServerPort = port
 				addr = net.JoinHostPort(cfg.ServerHost, fmt.Sprintf("%d", cfg.ServerPort))
 			}
@@ -683,9 +694,24 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		}
 	}
 
+	if isLocalHost(cfg.ServerHost) {
+		beadsDir := cfg.BeadsDir
+		if beadsDir == "" && cfg.Path != "" {
+			beadsDir = filepath.Dir(cfg.Path)
+		}
+		_ = doltserver.EnsurePortFile(beadsDir, cfg.ServerPort)
+	}
+
 	// All writers operate on main — transaction isolation via RunInTransaction
 	// replaces the former branch-per-polecat approach (BD_BRANCH).
 	store.branch = "main"
+
+	// GH#2315: Sync CLI remotes into SQL server on store open.
+	// After a server restart, dolt_remotes is empty (not persisted across sessions).
+	// CLI remotes survive in .dolt/config. Re-register them so DOLT_PUSH/DOLT_PULL work.
+	if !cfg.ReadOnly {
+		store.syncCLIRemotesToSQL(ctx)
+	}
 
 	return store, nil
 }
@@ -772,6 +798,11 @@ func buildServerDSN(cfg *Config, database string) string {
 // execWithLongTimeout opens a one-shot database connection with readTimeout=5m
 // and executes the given query. Push/pull operations can exceed the default
 // readTimeout when the server performs network I/O to git remotes.
+//
+// The query is wrapped in an explicit transaction (BEGIN/COMMIT) so that
+// DOLT_PULL merge operations succeed even when the server runs with
+// autocommit=1. Without this, Dolt rejects merges under autocommit because
+// it cannot expose conflict-resolution tables to the caller.
 func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args ...any) error {
 	cfg, err := mysql.ParseDSN(s.connStr)
 	if err != nil {
@@ -784,8 +815,15 @@ func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args 
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	_, err = db.ExecContext(ctx, query, args...)
-	return err
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // openServerConnection opens a connection to a dolt sql-server via MySQL protocol
@@ -978,7 +1016,9 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 	_, err = db.ExecContext(ctx, "ALTER TABLE dependencies DROP FOREIGN KEY fk_dep_depends_on")
 	if err == nil {
 		// DDL change succeeded - commit it so it persists (required for Dolt server mode)
-		_, _ = db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'migration: remove fk_dep_depends_on for external references')") // Best effort: migration commit is advisory; schema change already applied
+		// GH#2455: Stage only the affected table, not all dirty tables.
+		_, _ = db.ExecContext(ctx, "CALL DOLT_ADD('dependencies')")
+		_, _ = db.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'migration: remove fk_dep_depends_on for external references')") // Best effort: migration commit is advisory; schema change already applied
 	} else if !strings.Contains(strings.ToLower(err.Error()), "can't drop") &&
 		!strings.Contains(strings.ToLower(err.Error()), "doesn't exist") &&
 		!strings.Contains(strings.ToLower(err.Error()), "check that it exists") &&
@@ -1140,9 +1180,11 @@ func (s *DoltStore) Path() string {
 	return s.dbPath
 }
 
-// cliDir returns the directory for dolt CLI operations (push/pull/remote/fetch).
-// The actual database lives in a subdirectory of dbPath named after the database.
-func (s *DoltStore) cliDir() string {
+// CLIDir returns the directory for dolt CLI operations (push/pull/remote/fetch).
+// The actual database lives in a subdirectory of Path() named after the database.
+// Use this instead of Path() when running dolt CLI commands that target the
+// actual database (e.g., remote add/remove, push, pull).
+func (s *DoltStore) CLIDir() string {
 	if s.dbPath == "" {
 		return ""
 	}
@@ -1162,20 +1204,115 @@ func (s *DoltStore) commitAuthorString() string {
 	return fmt.Sprintf("%s <%s>", s.committerName, s.committerEmail)
 }
 
-// Commit creates a Dolt commit with the given message
+// Commit creates a Dolt commit with the given message.
+//
+// GH#2455: Stages all dirty tables EXCEPT config, then commits with '-m'.
+// The old '-Am' approach staged ALL dirty tables including config, which
+// swept up stale issue_prefix changes from concurrent operations. By
+// excluding config from automatic staging, we prevent the corruption.
+//
+// Callers that intentionally modify config (e.g., CommitPending after
+// 'bd config set') must call CommitWithConfig instead.
 func (s *DoltStore) Commit(ctx context.Context, message string) (retErr error) {
 	ctx, span := doltTracer.Start(ctx, "dolt.commit",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(s.doltSpanAttrs()...),
 	)
 	defer func() { endSpan(span, retErr) }()
+
+	// Pin a single connection so all operations run on the same Dolt session.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection: %w", err)
+	}
+	defer conn.Close()
+
+	// GH#2455: Stage all dirty tables EXCEPT config. Query dolt_status for
+	// dirty tables and stage each one individually, skipping config to avoid
+	// sweeping up stale issue_prefix changes from concurrent operations.
+	rows, err := conn.QueryContext(ctx, "SELECT table_name FROM dolt_status")
+	if err != nil {
+		// If dolt_status fails, fall back to nothing (rare edge case).
+		return fmt.Errorf("failed to query dolt_status: %w", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("failed to scan dolt_status: %w", err)
+		}
+		if table != "config" {
+			tables = append(tables, table)
+		}
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate dolt_status: %w", err)
+	}
+
+	if len(tables) == 0 {
+		return nil // Nothing to commit (all changes were config-only or dolt_ignore'd)
+	}
+
+	for _, table := range tables {
+		if _, err := conn.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
+			// Best effort: some tables may be dolt_ignore'd (e.g., wisps).
+			// DOLT_ADD fails for ignored tables; skip silently.
+			continue
+		}
+	}
+
 	// NOTE: In SQL procedure mode, Dolt defaults author to the authenticated SQL user
 	// (e.g. root@localhost). Always pass an explicit author for deterministic history.
-	if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
 		if isDoltNothingToCommit(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to commit: %w", err)
+	}
+
+	return nil
+}
+
+// CommitWithConfig creates a Dolt commit that includes the config table.
+// Use this instead of Commit when the caller intentionally modified config
+// (e.g., CommitPending after 'bd config set', 'bd init', or 'bd rename-prefix').
+// GH#2455: Commit() excludes config to prevent sweeping up stale changes.
+func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
+		if isDoltNothingToCommit(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to commit: %w", err)
+	}
+	return nil
+}
+
+// doltAddAndCommit stages the specified tables and commits on a pinned
+// connection. This prevents DOLT_COMMIT('-Am') from sweeping up stale
+// working set changes from concurrent operations (GH#2455).
+func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commitMsg string) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection: %w", err)
+	}
+	defer conn.Close()
+
+	for _, table := range tables {
+		if _, err := conn.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
+			return fmt.Errorf("dolt add %s: %w", table, err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
 	}
 	return nil
 }
@@ -1206,7 +1343,10 @@ func (s *DoltStore) CommitPending(ctx context.Context, actor string) (bool, erro
 	}
 
 	msg := s.buildBatchCommitMessage(ctx, actor)
-	if err := s.Commit(ctx, msg); err != nil {
+	// GH#2455: CommitPending is an explicit user action (bd dolt commit) that
+	// should include ALL pending changes, including config. Use CommitWithConfig
+	// instead of Commit to ensure intentional config changes are committed.
+	if err := s.CommitWithConfig(ctx, msg); err != nil {
 		// Dolt may report "nothing to commit" even when Status() showed changes
 		// (e.g., system tables or schema-only diffs). Treat as no-op.
 		errLower := strings.ToLower(err.Error())
@@ -1323,13 +1463,13 @@ func (s *DoltStore) isGitProtocolRemote(ctx context.Context) bool {
 				// Verify remote exists in CLI directory before routing to CLI push/pull.
 				// When the dolt sql-server is externally managed, remotes may exist only
 				// on the server's filesystem, not in the local dbPath.
-				return s.cliDir() != "" && doltutil.FindCLIRemote(s.cliDir(), s.remote) != ""
+				return s.CLIDir() != "" && doltutil.FindCLIRemote(s.CLIDir(), s.remote) != ""
 			}
 		}
 	}
 	// Fall back to CLI remotes (covers drift where remote exists only in filesystem)
-	if s.cliDir() != "" {
-		if url := doltutil.FindCLIRemote(s.cliDir(), s.remote); url != "" {
+	if s.CLIDir() != "" {
+		if url := doltutil.FindCLIRemote(s.CLIDir(), s.remote); url != "" {
 			return doltutil.IsGitProtocolURL(url)
 		}
 	}
@@ -1357,7 +1497,7 @@ func (s *DoltStore) doltCLIPush(ctx context.Context, force bool, creds *remoteCr
 	}
 	args = append(args, s.remote, s.branch)
 	cmd := exec.CommandContext(ctx, "dolt", args...) // #nosec G204 -- fixed command with validated remote/branch
-	cmd.Dir = s.cliDir()
+	cmd.Dir = s.CLIDir()
 	creds.applyToCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1373,7 +1513,7 @@ func (s *DoltStore) doltCLIPull(ctx context.Context, creds *remoteCredentials) e
 	ctx, cancel := context.WithTimeout(ctx, cliExecTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "dolt", "pull", s.remote, s.branch) // #nosec G204 -- fixed command
-	cmd.Dir = s.cliDir()
+	cmd.Dir = s.CLIDir()
 	creds.applyToCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1456,6 +1596,10 @@ func (s *DoltStore) ForcePush(ctx context.Context) (retErr error) {
 // Passes branch explicitly to avoid "did not specify a branch" errors.
 // For git-protocol remotes (SSH, git+https://, git://), uses CLI `dolt pull` to avoid MySQL connection timeouts.
 // For non-SSH Hosted Dolt (remoteUser set), uses CALL DOLT_PULL with --user authentication.
+//
+// If the pull results in merge conflicts on the metadata table only (e.g., from
+// stale dolt_auto_push_* rows on multi-machine setups), the conflicts are
+// automatically resolved using "theirs" strategy (GH#2466).
 func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
 	ctx, span := doltTracer.Start(ctx, "dolt.pull",
 		trace.WithSpanKind(trace.SpanKindClient),
@@ -1465,6 +1609,20 @@ func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
 		)...),
 	)
 	defer func() { endSpan(span, retErr) }()
+
+	// GH#2474: Auto-commit pending changes before pull to prevent
+	// "cannot merge with uncommitted changes" errors. Store initialization
+	// (schema init, molecule loading, metadata writes) can dirty the working
+	// set before the user's pull command runs.
+	if !s.readOnly {
+		if err := s.Commit(ctx, "auto-commit before pull"); err != nil {
+			// "nothing to commit" is fine — working set is already clean
+			if !isDoltNothingToCommit(err) {
+				return fmt.Errorf("failed to commit pending changes before pull: %w", err)
+			}
+		}
+	}
+
 	creds := s.mainRemoteCredentials()
 	// Git-protocol remotes: use CLI to avoid MySQL connection timeout during transfer.
 	// Must check before remoteUser — Hosted Dolt SSH remotes have remoteUser set
@@ -1481,7 +1639,7 @@ func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
 	}
 	if s.remoteUser != "" {
 		return withEnvCredentials(creds, func() error {
-			if err := s.execWithLongTimeout(ctx, "CALL DOLT_PULL('--user', ?, ?, ?)", s.remoteUser, s.remote, s.branch); err != nil {
+			if err := s.pullWithAutoResolve(ctx, "CALL DOLT_PULL('--user', ?, ?, ?)", s.remoteUser, s.remote, s.branch); err != nil {
 				return fmt.Errorf("failed to pull from %s/%s: %w", s.remote, s.branch, err)
 			}
 			if err := s.resetAutoIncrements(ctx); err != nil {
@@ -1490,13 +1648,123 @@ func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
 			return nil
 		})
 	}
-	if err := s.execWithLongTimeout(ctx, "CALL DOLT_PULL(?, ?)", s.remote, s.branch); err != nil {
+	if err := s.pullWithAutoResolve(ctx, "CALL DOLT_PULL(?, ?)", s.remote, s.branch); err != nil {
 		return fmt.Errorf("failed to pull from %s/%s: %w", s.remote, s.branch, err)
 	}
 	if err := s.resetAutoIncrements(ctx); err != nil {
 		return fmt.Errorf("failed to reset auto-increments after pull: %w", err)
 	}
 	return nil
+}
+
+// pullWithAutoResolve executes a DOLT_PULL query with long timeout and auto-resolves
+// metadata-only merge conflicts using "theirs" strategy. This handles the common case
+// where machine-local metadata rows (e.g., dolt_auto_push_*) diverge across clones
+// and cause recurring merge conflicts on pull (GH#2466).
+//
+// Dolt may report merge conflicts in two ways:
+//  1. DOLT_PULL itself returns an error (under autocommit)
+//  2. DOLT_PULL succeeds but tx.Commit() fails (conflicts in working set)
+//
+// This method handles both by checking for conflicts after the pull call
+// (whether it errored or not) and auto-resolving metadata-only conflicts.
+func (s *DoltStore) pullWithAutoResolve(ctx context.Context, query string, args ...any) error {
+	cfg, err := mysql.ParseDSN(s.connStr)
+	if err != nil {
+		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
+	}
+	cfg.ReadTimeout = 5 * time.Minute
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		return fmt.Errorf("failed to open long-timeout connection: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	// Allow commits with conflicts so we can inspect and resolve them.
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("failed to set dolt_allow_commit_conflicts: %w", err)
+	}
+
+	_, pullErr := tx.ExecContext(ctx, query, args...)
+
+	// Check for merge conflicts regardless of whether DOLT_PULL errored.
+	// Some Dolt versions error on conflicts, others leave them in the working set.
+	resolved, resolveErr := s.tryAutoResolveMetadataConflicts(ctx, tx)
+	if resolveErr != nil {
+		_ = tx.Rollback()
+		if pullErr != nil {
+			return pullErr
+		}
+		return resolveErr
+	}
+
+	if pullErr != nil && !resolved {
+		// Pull failed for a non-conflict reason, or conflicts include non-metadata tables.
+		_ = tx.Rollback()
+		return pullErr
+	}
+
+	return tx.Commit()
+}
+
+// tryAutoResolveMetadataConflicts checks if all merge conflicts are on the metadata
+// table and resolves them with "theirs" strategy. Returns (true, nil) if all conflicts
+// were resolved, (false, nil) if non-metadata conflicts exist, or (false, err) on error.
+func (s *DoltStore) tryAutoResolveMetadataConflicts(ctx context.Context, tx *sql.Tx) (bool, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT `table`, num_conflicts FROM dolt_conflicts")
+	if err != nil {
+		return false, fmt.Errorf("failed to query conflicts: %w", err)
+	}
+
+	type conflict struct {
+		table string
+		count int
+	}
+	var conflicts []conflict
+	for rows.Next() {
+		var c conflict
+		if err := rows.Scan(&c.table, &c.count); err != nil {
+			_ = rows.Close()
+			return false, fmt.Errorf("failed to scan conflict: %w", err)
+		}
+		conflicts = append(conflicts, c)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	if len(conflicts) == 0 {
+		return false, nil // No conflicts to resolve — error was something else
+	}
+
+	// Only auto-resolve if ALL conflicts are on the metadata table.
+	for _, c := range conflicts {
+		if c.table != "metadata" {
+			return false, nil
+		}
+	}
+
+	// Resolve metadata conflicts with "theirs" — remote values win.
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 'metadata')"); err != nil {
+		return false, fmt.Errorf("failed to resolve metadata conflicts: %w", err)
+	}
+
+	// GH#2455: Stage only metadata (the table we resolved), not all dirty tables.
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD('metadata')"); err != nil {
+		return false, fmt.Errorf("failed to stage metadata: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'auto-resolve metadata merge conflicts (GH#2466)')"); err != nil {
+		return false, fmt.Errorf("failed to commit resolved conflicts: %w", err)
+	}
+
+	return true, nil
 }
 
 func (s *DoltStore) resetAutoIncrements(ctx context.Context) error {
@@ -1592,6 +1860,16 @@ func (s *DoltStore) CurrentBranch(ctx context.Context) (string, error) {
 	return branch, nil
 }
 
+// ResetToCommit performs a hard reset of the current branch to the given commit hash.
+// Used by the post-checkout hook to sync Dolt state with a previously recorded BEADS_HEAD.
+func (s *DoltStore) ResetToCommit(ctx context.Context, commitHash string) error {
+	_, err := s.db.ExecContext(ctx, "CALL DOLT_RESET('--hard', ?)", commitHash)
+	if err != nil {
+		return fmt.Errorf("failed to reset to commit %s: %w", commitHash, err)
+	}
+	return nil
+}
+
 // DeleteBranch deletes a branch (used to clean up import branches)
 func (s *DoltStore) DeleteBranch(ctx context.Context, branch string) error {
 	_, err := s.db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", branch)
@@ -1624,14 +1902,8 @@ func (s *DoltStore) Log(ctx context.Context, limit int) ([]CommitInfo, error) {
 	return commits, rows.Err()
 }
 
-// CommitInfo represents a Dolt commit
-type CommitInfo struct {
-	Hash    string
-	Author  string
-	Email   string
-	Date    time.Time
-	Message string
-}
+// CommitInfo is an alias for storage.CommitInfo.
+type CommitInfo = storage.CommitInfo
 
 // HistoryEntry represents a row from dolt_history_* table
 type HistoryEntry struct {
@@ -1693,14 +1965,8 @@ func (s *DoltStore) Status(ctx context.Context) (*DoltStatus, error) {
 	return status, rows.Err()
 }
 
-// DoltStatus represents the current repository status
-type DoltStatus struct {
-	Staged   []StatusEntry
-	Unstaged []StatusEntry
-}
+// DoltStatus is an alias for storage.Status.
+type DoltStatus = storage.Status
 
-// StatusEntry represents a changed table
-type StatusEntry struct {
-	Table  string
-	Status string // "new", "modified", "deleted"
-}
+// StatusEntry is an alias for storage.StatusEntry.
+type StatusEntry = storage.StatusEntry

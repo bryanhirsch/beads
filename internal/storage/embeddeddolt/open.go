@@ -17,8 +17,10 @@ import (
 	doltembed "github.com/dolthub/driver"
 )
 
-// validIdentifier matches safe SQL identifiers (letters, digits, underscores, hyphens).
-var validIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*$`)
+// validIdentifier matches safe SQL identifiers (letters, digits, underscores).
+// Hyphens are excluded because database names are interpolated into system
+// variable identifiers (@@<db>_head_ref) where hyphens are invalid.
+var validIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 const (
 	commitName  = "beads"
@@ -72,7 +74,7 @@ func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func()
 		return nil, nil, errors.Join(err, cleanup())
 	}
 
-	if strings.TrimSpace(branch) != "" && strings.TrimSpace(database) != "" {
+	if strings.TrimSpace(database) != "" {
 		if !validIdentifier.MatchString(database) {
 			return nil, nil, errors.Join(
 				fmt.Errorf("invalid database name: %q", database), cleanup())
@@ -80,8 +82,10 @@ func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func()
 		if _, err := db.ExecContext(ctx, "USE `"+database+"`"); err != nil {
 			return nil, nil, errors.Join(err, cleanup())
 		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("SET @@%s_head_ref = %s", database, sqlStringLiteral(branch))); err != nil {
-			return nil, nil, errors.Join(err, cleanup())
+		if strings.TrimSpace(branch) != "" {
+			if _, err := db.ExecContext(ctx, fmt.Sprintf("SET @@%s_head_ref = %s", database, sqlStringLiteral(branch))); err != nil {
+				return nil, nil, errors.Join(err, cleanup())
+			}
 		}
 	}
 

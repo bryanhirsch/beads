@@ -65,9 +65,9 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 
 	ctx := rootCtx
 
-	// mol squash requires direct store access (daemon auto-bypassed for wisp ops)
+	// mol squash requires direct store access
 	if store == nil {
-		FatalErrorWithHint("no database connection", "run 'bd init' or 'bd import' to initialize the database")
+		FatalErrorWithHint("no database connection", "run 'bd doctor' to diagnose, or 'bd init' to create a new database")
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")

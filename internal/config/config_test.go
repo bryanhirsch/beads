@@ -124,7 +124,6 @@ func TestConfigFile(t *testing.T) {
 	// Create a config file
 	configContent := `
 json: true
-no-daemon: true
 actor: configuser
 `
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -159,10 +158,6 @@ actor: configuser
 		t.Errorf("GetBool(json) = %v, want true", got)
 	}
 
-	if got := GetBool("no-daemon"); got != true {
-		t.Errorf("GetBool(no-daemon) = %v, want true", got)
-	}
-
 	if got := GetString("actor"); got != "configuser" {
 		t.Errorf("GetString(actor) = %q, want \"configuser\"", got)
 	}
@@ -185,7 +180,6 @@ func TestLocalConfigOverride(t *testing.T) {
 	// Create main config file with some settings
 	configContent := `
 json: false
-no-daemon: false
 actor: project-user
 `
 	configPath := filepath.Join(beadsDir, "config.yaml")
@@ -195,7 +189,6 @@ actor: project-user
 
 	// Create local config file that overrides some settings
 	localConfigContent := `
-no-daemon: true
 actor: local-user
 `
 	localConfigPath := filepath.Join(beadsDir, "config.local.yaml")
@@ -212,10 +205,6 @@ actor: local-user
 	}
 
 	// Test that local config values override project config values
-	if got := GetBool("no-daemon"); got != true {
-		t.Errorf("GetBool(no-daemon) = %v, want true (local override)", got)
-	}
-
 	if got := GetString("actor"); got != "local-user" {
 		t.Errorf("GetString(actor) = %q, want \"local-user\" (local override)", got)
 	}
@@ -1114,26 +1103,6 @@ validation:
 	}
 }
 
-// Tests for sync mode configuration (hq-ew1mbr.3)
-
-func TestSyncModeConstants(t *testing.T) {
-	if SyncModeDoltNative != "dolt-native" {
-		t.Errorf("SyncModeDoltNative = %q, want \"dolt-native\"", SyncModeDoltNative)
-	}
-}
-
-func TestSyncTriggerConstants(t *testing.T) {
-	if SyncTriggerPush != "push" {
-		t.Errorf("SyncTriggerPush = %q, want \"push\"", SyncTriggerPush)
-	}
-	if SyncTriggerChange != "change" {
-		t.Errorf("SyncTriggerChange = %q, want \"change\"", SyncTriggerChange)
-	}
-	if SyncTriggerPull != "pull" {
-		t.Errorf("SyncTriggerPull = %q, want \"pull\"", SyncTriggerPull)
-	}
-}
-
 func TestSovereigntyConstants(t *testing.T) {
 	if SovereigntyT1 != "T1" {
 		t.Errorf("SovereigntyT1 = %q, want \"T1\"", SovereigntyT1)
@@ -1146,34 +1115,6 @@ func TestSovereigntyConstants(t *testing.T) {
 	}
 	if SovereigntyT4 != "T4" {
 		t.Errorf("SovereigntyT4 = %q, want \"T4\"", SovereigntyT4)
-	}
-}
-
-func TestSyncConfigDefaults(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Test sync mode default
-	if got := GetSyncMode(); got != SyncModeDoltNative {
-		t.Errorf("GetSyncMode() = %q, want %q", got, SyncModeDoltNative)
-	}
-
-	// Test sync config defaults
-	cfg := GetSyncConfig()
-	if cfg.Mode != SyncModeDoltNative {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", cfg.Mode, SyncModeDoltNative)
-	}
-	if cfg.ExportOn != SyncTriggerPush {
-		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", cfg.ExportOn, SyncTriggerPush)
-	}
-	if cfg.ImportOn != SyncTriggerPull {
-		t.Errorf("GetSyncConfig().ImportOn = %q, want %q", cfg.ImportOn, SyncTriggerPull)
 	}
 }
 
@@ -1198,17 +1139,12 @@ func TestFederationConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestSyncConfigFromFile(t *testing.T) {
+func TestFederationConfigFromFile(t *testing.T) {
 	// Create a temporary directory for config file
 	tmpDir := t.TempDir()
 
-	// Create a config file with sync settings
+	// Create a config file with federation settings
 	configContent := `
-sync:
-  mode: dolt-native
-  export_on: change
-  import_on: change
-
 federation:
   remote: dolthub://myorg/beads
   sovereignty: T2
@@ -1231,18 +1167,6 @@ federation:
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
 
-	// Test sync config
-	syncCfg := GetSyncConfig()
-	if syncCfg.Mode != SyncModeDoltNative {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", syncCfg.Mode, SyncModeDoltNative)
-	}
-	if syncCfg.ExportOn != SyncTriggerChange {
-		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", syncCfg.ExportOn, SyncTriggerChange)
-	}
-	if syncCfg.ImportOn != SyncTriggerChange {
-		t.Errorf("GetSyncConfig().ImportOn = %q, want %q", syncCfg.ImportOn, SyncTriggerChange)
-	}
-
 	// Test federation config
 	fedCfg := GetFederationConfig()
 	if fedCfg.Remote != "dolthub://myorg/beads" {
@@ -1250,23 +1174,6 @@ federation:
 	}
 	if fedCfg.Sovereignty != SovereigntyT2 {
 		t.Errorf("GetFederationConfig().Sovereignty = %q, want %q", fedCfg.Sovereignty, SovereigntyT2)
-	}
-}
-
-func TestGetSyncModeInvalid(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Set invalid mode - always returns dolt-native now
-	Set("sync.mode", "invalid-mode")
-	if got := GetSyncMode(); got != SyncModeDoltNative {
-		t.Errorf("GetSyncMode() with invalid mode = %q, want %q", got, SyncModeDoltNative)
 	}
 }
 
@@ -1575,6 +1482,61 @@ func TestGetStringFromDir(t *testing.T) {
 		writeConfig(t, dir, "actor: alice\n")
 		if got := GetStringFromDir(dir, "actor"); got != "alice" {
 			t.Errorf("got %q, want %q", got, "alice")
+		}
+	})
+}
+
+func TestIsBranchStrategyEnabled(t *testing.T) {
+	t.Run("nil viper returns false", func(t *testing.T) {
+		savedV := v
+		v = nil
+		defer func() { v = savedV }()
+
+		if IsBranchStrategyEnabled() {
+			t.Error("expected false with nil viper")
+		}
+	})
+
+	t.Run("no branch_strategy keys returns false", func(t *testing.T) {
+		restore := envSnapshot(t)
+		defer restore()
+
+		if err := Initialize(); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+
+		if IsBranchStrategyEnabled() {
+			t.Error("expected false with no branch_strategy keys set")
+		}
+	})
+
+	t.Run("any branch_strategy key returns true", func(t *testing.T) {
+		restore := envSnapshot(t)
+		defer restore()
+
+		if err := Initialize(); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		Set("branch_strategy.prompt", true)
+		defer Set("branch_strategy.prompt", nil)
+
+		if !IsBranchStrategyEnabled() {
+			t.Error("expected true with branch_strategy.prompt set")
+		}
+	})
+
+	t.Run("default_strategy alone returns true", func(t *testing.T) {
+		restore := envSnapshot(t)
+		defer restore()
+
+		if err := Initialize(); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		Set("branch_strategy.default_strategy", "stay-on-main")
+		defer Set("branch_strategy.default_strategy", nil)
+
+		if !IsBranchStrategyEnabled() {
+			t.Error("expected true with branch_strategy.default_strategy set")
 		}
 	})
 }

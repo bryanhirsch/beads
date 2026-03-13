@@ -42,17 +42,43 @@ func hookSectionEndLine() string {
 	return fmt.Sprintf("%s v%s ---", hookSectionEndPrefix, Version)
 }
 
+// hookTimeoutSeconds is the maximum time a beads hook is allowed to run before
+// being killed and allowing the git operation to proceed.  A bounded timeout
+// prevents `bd hooks run` from hanging `git push` indefinitely (GH#2453).
+// The value can be overridden via the BEADS_HOOK_TIMEOUT environment variable.
+const hookTimeoutSeconds = 30
+
 // generateHookSection returns the marked section content for a given hook name.
 // The section is self-contained: it checks for bd availability, runs the hook
 // via 'bd hooks run', and propagates exit codes — without preventing any user
 // content after the section from executing on success.
+//
+// Resilience (GH#2453, GH#2449):
+//   - A configurable timeout prevents hooks from hanging git operations.
+//   - If the beads database is not initialized (exit code 3), the hook exits
+//     successfully with a warning so that git operations are not blocked.
 func generateHookSection(hookName string) string {
 	return hookSectionBeginLine() + "\n" +
 		"# This section is managed by beads. Do not remove these markers.\n" +
 		"if command -v bd >/dev/null 2>&1; then\n" +
 		"  export BD_GIT_HOOK=1\n" +
-		"  bd hooks run " + hookName + " \"$@\"\n" +
-		"  _bd_exit=$?; if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi\n" +
+		"  _bd_timeout=${BEADS_HOOK_TIMEOUT:-" + fmt.Sprintf("%d", hookTimeoutSeconds) + "}\n" +
+		"  if command -v timeout >/dev/null 2>&1; then\n" +
+		"    timeout \"$_bd_timeout\" bd hooks run " + hookName + " \"$@\"\n" +
+		"    _bd_exit=$?\n" +
+		"    if [ $_bd_exit -eq 124 ]; then\n" +
+		"      echo >&2 \"beads: hook '" + hookName + "' timed out after ${_bd_timeout}s — continuing without beads\"\n" +
+		"      _bd_exit=0\n" +
+		"    fi\n" +
+		"  else\n" +
+		"    bd hooks run " + hookName + " \"$@\"\n" +
+		"    _bd_exit=$?\n" +
+		"  fi\n" +
+		"  if [ $_bd_exit -eq 3 ]; then\n" +
+		"    echo >&2 \"beads: database not initialized — skipping hook '" + hookName + "'\"\n" +
+		"    _bd_exit=0\n" +
+		"  fi\n" +
+		"  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi\n" +
 		"fi\n" +
 		hookSectionEndLine() + "\n"
 }
@@ -601,13 +627,16 @@ func installHooksWithOptions(hookNames []string, force bool, shared bool, chain 
 }
 
 func configureSharedHooksPath() error {
-	// Set git config core.hooksPath to .beads-hooks
-	// Note: This may run before .beads exists, so it uses git.GetRepoRoot() directly
+	// Set git config core.hooksPath to an absolute path pointing to .beads-hooks.
+	// Using an absolute path is critical for git worktrees (GH#2414):
+	// git resolves relative core.hooksPath relative to the working tree root.
+	// Note: This may run before .beads exists, so it uses git.GetRepoRoot() directly.
 	repoRoot := git.GetRepoRoot()
 	if repoRoot == "" {
 		return fmt.Errorf("not in a git repository")
 	}
-	cmd := exec.Command("git", "config", "core.hooksPath", ".beads-hooks")
+	absHooksPath := filepath.Join(repoRoot, ".beads-hooks")
+	cmd := exec.Command("git", "config", "core.hooksPath", absHooksPath)
 	cmd.Dir = repoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git config failed: %w (output: %s)", err, string(output))
@@ -616,12 +645,17 @@ func configureSharedHooksPath() error {
 }
 
 func configureBeadsHooksPath() error {
-	// Set git config core.hooksPath to .beads/hooks
+	// Set git config core.hooksPath to an absolute path pointing to .beads/hooks.
+	// Using an absolute path is critical for git worktrees (GH#2414):
+	// git resolves relative core.hooksPath relative to the working tree root,
+	// so in a worktree ".beads/hooks" would resolve to <worktree>/.beads/hooks/
+	// which doesn't exist — the hooks live in the main repo's .beads/hooks/.
 	repoRoot := git.GetRepoRoot()
 	if repoRoot == "" {
 		return fmt.Errorf("not in a git repository")
 	}
-	cmd := exec.Command("git", "config", "core.hooksPath", ".beads/hooks")
+	absHooksPath := filepath.Join(repoRoot, ".beads", "hooks")
+	cmd := exec.Command("git", "config", "core.hooksPath", absHooksPath)
 	cmd.Dir = repoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git config failed: %w (output: %s)", err, string(output))
@@ -708,7 +742,11 @@ func resetHooksPathIfBeadsManaged() error {
 	}
 
 	hooksPath := strings.TrimSpace(string(out))
-	if hooksPath == ".beads/hooks" || hooksPath == ".beads-hooks" {
+	// Match both relative (legacy) and absolute (GH#2414) beads hooks paths
+	absBeadsHooks := filepath.Join(repoRoot, ".beads", "hooks")
+	absSharedHooks := filepath.Join(repoRoot, ".beads-hooks")
+	if hooksPath == ".beads/hooks" || hooksPath == ".beads-hooks" ||
+		hooksPath == absBeadsHooks || hooksPath == absSharedHooks {
 		cmd = exec.Command("git", "config", "--unset", "core.hooksPath")
 		cmd.Dir = repoRoot
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -813,7 +851,34 @@ func runPostCheckoutHook(args []string) int {
 	if exitCode := runChainedHook("post-checkout", args); exitCode != 0 {
 		return exitCode
 	}
+
+	// Only run beads ref sync for branch-level checkouts (flag=1).
+	// flag=0 means file-level checkout — skip entirely.
+	if len(args) < 3 || args[2] != "1" {
+		return 0
+	}
+
+	// Skip during rebase — intermediate checkouts shouldn't trigger sync
+	if isRebaseInProgress() {
+		return 0
+	}
+
 	return 0
+}
+
+// isTerminal returns true if both stdin and stderr are connected to a terminal.
+// Prompts write to stderr and read from stdin, so both must be TTYs.
+func isTerminal() bool {
+	for _, f := range []*os.File{os.Stdin, os.Stderr} {
+		fi, err := f.Stat()
+		if err != nil {
+			return false
+		}
+		if fi.Mode()&os.ModeCharDevice == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // runPrepareCommitMsgHook adds agent identity trailers to commit messages.
@@ -986,11 +1051,18 @@ func getPinnedMolecule() string {
 // =============================================================================
 
 // isRebaseInProgress checks if a rebase is in progress.
+// Uses git.GetGitDir() to resolve the correct path, which handles
+// both regular repos (.git/ directory) and worktrees (.git file
+// pointing to .git/worktrees/<name>/).
 func isRebaseInProgress() bool {
-	if _, err := os.Stat(".git/rebase-merge"); err == nil {
+	gitDir, err := git.GetGitDir()
+	if err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(gitDir, "rebase-merge")); err == nil {
 		return true
 	}
-	if _, err := os.Stat(".git/rebase-apply"); err == nil {
+	if _, err := os.Stat(filepath.Join(gitDir, "rebase-apply")); err == nil {
 		return true
 	}
 	return false

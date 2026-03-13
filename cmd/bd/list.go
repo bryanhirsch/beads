@@ -21,10 +21,10 @@ import (
 	"github.com/steveyegge/beads/internal/validation"
 )
 
-// storageExecutor handles operations that need to work with both direct store and daemon mode
+// storageExecutor handles operations that need a store connection
 type storageExecutor func(store *dolt.DoltStore) error
 
-// withStorage executes an operation with either the direct store or a read-only store in daemon mode
+// withStorage executes an operation with either the direct store or a read-only store
 func withStorage(ctx context.Context, store *dolt.DoltStore, dbPath string, fn storageExecutor) error {
 	if store != nil {
 		return fn(store)
@@ -223,10 +223,35 @@ func sortIssues(issues []*types.Issue, sortBy string, reverse bool) {
 	})
 }
 
+// knownListFlags maps bare words that users might pass as positional args
+// but are actually flag names. Each maps to a hint for the error message.
+var knownListFlags = map[string]string{
+	"ready":   "--ready",
+	"tree":    "--tree",
+	"flat":    "--flat",
+	"all":     "--all",
+	"long":    "--long",
+	"watch":   "--watch",
+	"pretty":  "--pretty",
+	"pinned":  "--pinned",
+	"overdue": "--overdue",
+}
+
 var listCmd = &cobra.Command{
 	Use:     "list",
 	GroupID: "issues",
 	Short:   "List issues",
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return nil
+		}
+		for _, arg := range args {
+			if hint, ok := knownListFlags[arg]; ok {
+				return fmt.Errorf("unknown argument %q; did you mean %q or 'bd %s'?", arg, hint, arg)
+			}
+		}
+		return fmt.Errorf("bd list does not accept positional arguments; use flags instead (see bd list --help)")
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		status, _ := cmd.Flags().GetString("status")
 		// --state is alias for --status (desire path: bd-9h3w)
@@ -330,7 +355,7 @@ var listCmd = &cobra.Command{
 		if flatFormat {
 			treeFormat = false
 		}
-		prettyFormat = prettyFormat || treeFormat // --tree is alias for --pretty
+		prettyFormat = (prettyFormat || treeFormat) && !jsonOutput // --tree is alias for --pretty; JSON wins
 		watchMode, _ := cmd.Flags().GetBool("watch")
 
 		// Pager control (bd-jdz3)
@@ -564,9 +589,12 @@ var listCmd = &cobra.Command{
 		if pinnedFlag {
 			pinned := true
 			filter.Pinned = &pinned
-		} else if noPinnedFlag || (status != "pinned" && !allFlag) {
+		} else if noPinnedFlag || (status != "pinned" && status != "hooked" && !allFlag) {
 			// Exclude pinned beads by default — they are permanent references,
 			// not actionable work items. Use --pinned or --all to see them. (bd-uhcg)
+			// Also skip exclusion for --status=hooked: beads transitioning from
+			// pinned to hooked retain the legacy pinned=1 column, and excluding
+			// them breaks gt hook status detection (bd-pr-sheriff bug).
 			pinned := false
 			filter.Pinned = &pinned
 		}
@@ -740,7 +768,7 @@ var listCmd = &cobra.Command{
 		}
 
 		// Handle pretty format (GH#654)
-		// JSON output takes priority over pretty/tree format (bd-list-json-fix)
+		// JSON output takes priority over pretty/tree format (bd-list-json-fix, bd-03r)
 		if prettyFormat && !jsonOutput {
 			// Special handling for --tree --parent combination (hierarchical descendants)
 			if parentID != "" {

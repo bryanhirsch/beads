@@ -99,7 +99,7 @@ var createCmd = &cobra.Command{
 			}
 		}
 
-		design, _ := cmd.Flags().GetString("design")
+		design, _ := getDesignFlag(cmd)
 		acceptance, _ := cmd.Flags().GetString("acceptance")
 		notes, _ := cmd.Flags().GetString("notes")
 		specID, _ := cmd.Flags().GetString("spec-id")
@@ -486,11 +486,14 @@ var createCmd = &cobra.Command{
 			// Validate prefix matches database prefix
 			ctx := rootCtx
 
-			// Get database prefix and allowed prefixes from config
+			// Get database prefix and allowed prefixes from config.
+			// YAML config takes precedence over DB — in shared-server mode the DB
+			// may belong to a different project (GH#2469).
 			var dbPrefix, allowedPrefixes string
-			dbPrefix, _ = store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix is a valid fallback
-			if dbPrefix == "" {
-				dbPrefix = config.GetString("issue-prefix")
+			if yamlPrefix := config.GetString("issue-prefix"); yamlPrefix != "" {
+				dbPrefix = yamlPrefix
+			} else {
+				dbPrefix, _ = store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix is a valid fallback
 			}
 			allowedPrefixes, _ = store.GetConfig(ctx, "allowed_prefixes") // Best effort: empty means no prefix restriction
 
@@ -749,7 +752,7 @@ var createCmd = &cobra.Command{
 		}
 
 		// If issue was routed to a different repo, commit pending changes.
-		// Push is NOT done here — the daemon handles periodic pushes to
+		// Push is NOT done here — periodic sync handles pushes to
 		// DoltHub remotes. Per-create pushes caused 22GB of git-remote-cache
 		// bloat with dozens of agents creating wisps constantly (hq-glw).
 		if repoPath != "." && targetStore != nil {

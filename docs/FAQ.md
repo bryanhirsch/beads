@@ -198,7 +198,7 @@ bd dolt push    # Push changes to Dolt remote
 bd dolt pull    # Pull changes from Dolt remote
 ```
 
-The `bd import` and `bd export` commands exist for data migration and portability (e.g., bootstrapping new clones, backing up data), not for day-to-day sync.
+The `bd export` command exists for data portability (e.g., backing up data), and `bd init --from-jsonl` can bootstrap a new database from an export. These are not needed for day-to-day sync.
 
 ### What if my database feels stale after a colleague pushes changes?
 
@@ -226,25 +226,33 @@ cd ~/project2 && bd init --prefix proj2
 Each project gets its own `.beads/` directory with its own Dolt database. bd auto-discovers the correct database based on your current directory (walks up like git).
 
 **Multi-project scenarios work seamlessly:**
-- Multiple agents working on different projects simultaneously → No conflicts
-- Same machine, different repos → Each finds its own `.beads/*.db` automatically
-- Agents in subdirectories → bd walks up to find the project root (like git)
-- **Per-project Dolt servers** → Each project gets its own Dolt server (LSP model)
+- Multiple agents working on different projects simultaneously - no conflicts
+- Same machine, different repos - each finds its own `.beads/` automatically
+- Agents in subdirectories - bd walks up to find the project root (like git)
+- **Per-project Dolt servers** (default) - each project gets its own Dolt server
+- **Shared Dolt server** (opt-in) - all projects share a single server for reduced resource usage
 
 **Limitation:** Issues cannot reference issues in other projects. Each database is isolated by design. If you need cross-project tracking, initialize bd in a parent directory that contains both projects.
 
 **Example:** Multiple agents, multiple projects, same machine:
 ```bash
 # Agent 1 working on web app
-cd ~/work/webapp && bd ready --json    # Uses ~/work/webapp/.beads/webapp.db
+cd ~/work/webapp && bd ready --json    # Uses ~/work/webapp/.beads/ database "webapp"
 
 # Agent 2 working on API
-cd ~/work/api && bd ready --json       # Uses ~/work/api/.beads/api.db
+cd ~/work/api && bd ready --json       # Uses ~/work/api/.beads/ database "api"
 
-# No conflicts! Completely isolated databases and Dolt servers.
+# No conflicts! Completely isolated databases.
 ```
 
-**Architecture:** bd uses per-project Dolt servers (like LSP/language servers) for complete database isolation. See [ADVANCED.md](ADVANCED.md) for details.
+**Shared server mode** (recommended for machines with 2+ projects):
+```bash
+# Enable shared server - single Dolt process serves all projects
+export BEADS_DOLT_SHARED_SERVER=1   # add to shell profile for machine-wide
+# Or per-project: bd dolt set shared-server true
+```
+
+**Architecture:** By default, bd uses per-project Dolt servers (like LSP/language servers). With shared server mode enabled, a single server at `~/.beads/shared-server/` handles all projects, each using its own database. See [DOLT.md](DOLT.md) for details.
 
 ### What happens if two agents work on the same issue?
 
@@ -293,7 +301,7 @@ We don't have automated migration tools yet, but you can:
 
 1. Export issues from your current tracker (usually CSV or JSON)
 2. Write a simple script to convert to bd's JSONL format
-3. Import with `bd import -i issues.jsonl`
+3. Place the JSONL file at `.beads/issues.jsonl` and run `bd init --from-jsonl`
 
 See [examples/](../examples/) for scripting patterns. Contributions welcome!
 
@@ -426,15 +434,9 @@ See [WORKTREES.md](WORKTREES.md) for details.
 
 ### Why did beads create worktrees in my .git directory?
 
-Beads automatically creates git worktrees when using the **sync-branch** feature. This happens when you:
-- Run `bd init --branch <name>`
-- Set `bd config set sync.branch <name>`
+Older versions of beads created git worktrees for a **sync-branch** feature that has since been removed. Dolt now stores data under `refs/dolt/data`, separate from standard Git refs, so a separate branch is no longer needed.
 
-The worktrees allow beads to commit issue updates to a separate branch without switching your working directory.
-
-**Location:** `.git/beads-worktrees/<sync-branch>/`
-
-**Common issue:** If you see "branch already checked out" errors when switching branches, remove the beads worktrees:
+If you have leftover worktrees from an older version, you can safely remove them:
 
 ```bash
 rm -rf .git/beads-worktrees

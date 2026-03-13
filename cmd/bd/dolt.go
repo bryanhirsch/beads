@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -159,7 +157,9 @@ uncommitted changes in its working set).`,
 			if err := st.ForcePush(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				if isRemoteNotFoundErr(err) {
-					fmt.Fprintf(os.Stderr, "Hint: run 'bd dolt remote add <name> <url>' to register the remote.\n")
+					fmt.Fprintf(os.Stderr, "Hint: use 'bd dolt remote add <name> <url>' (not 'dolt remote add').\n")
+					fmt.Fprintf(os.Stderr, "  Running 'dolt remote add' directly may add the remote to the wrong directory.\n")
+					fmt.Fprintf(os.Stderr, "  Use 'bd dolt remote list' to check for discrepancies.\n")
 				}
 				os.Exit(1)
 			}
@@ -167,7 +167,9 @@ uncommitted changes in its working set).`,
 			if err := st.Push(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				if isRemoteNotFoundErr(err) {
-					fmt.Fprintf(os.Stderr, "Hint: run 'bd dolt remote add <name> <url>' to register the remote.\n")
+					fmt.Fprintf(os.Stderr, "Hint: use 'bd dolt remote add <name> <url>' (not 'dolt remote add').\n")
+					fmt.Fprintf(os.Stderr, "  Running 'dolt remote add' directly may add the remote to the wrong directory.\n")
+					fmt.Fprintf(os.Stderr, "  Use 'bd dolt remote list' to check for discrepancies.\n")
 				}
 				os.Exit(1)
 			}
@@ -195,7 +197,9 @@ variables for authentication.`,
 		if err := st.Pull(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			if isRemoteNotFoundErr(err) {
-				fmt.Fprintf(os.Stderr, "Hint: run 'bd dolt remote add <name> <url>' to register the remote.\n")
+				fmt.Fprintf(os.Stderr, "Hint: use 'bd dolt remote add <name> <url>' (not 'dolt remote add').\n")
+				fmt.Fprintf(os.Stderr, "  Running 'dolt remote add' directly may add the remote to the wrong directory.\n")
+				fmt.Fprintf(os.Stderr, "  Use 'bd dolt remote list' to check for discrepancies.\n")
 			}
 			os.Exit(1)
 		}
@@ -283,6 +287,9 @@ required. Use this command for explicit control or diagnostics.`,
 		fmt.Printf("Dolt server started (PID %d, port %d)\n", state.PID, state.Port)
 		fmt.Printf("  Data: %s\n", state.DataDir)
 		fmt.Printf("  Logs: %s\n", doltserver.LogPath(serverDir))
+		if doltserver.IsSharedServerMode() {
+			fmt.Println("  Mode: shared server")
+		}
 	},
 }
 
@@ -347,48 +354,9 @@ Displays whether the server is running, its PID, port, and data directory.`,
 		fmt.Printf("  Port: %d\n", state.Port)
 		fmt.Printf("  Data: %s\n", state.DataDir)
 		fmt.Printf("  Logs: %s\n", doltserver.LogPath(serverDir))
-	},
-}
-
-var doltIdleMonitorCmd = &cobra.Command{
-	Use:    "idle-monitor",
-	Short:  "Run idle monitor (internal, not for direct use)",
-	Hidden: true,
-	Run: func(cmd *cobra.Command, args []string) {
-		beadsDir, _ := cmd.Flags().GetString("beads-dir")
-		if beadsDir == "" {
-			beadsDir = beads.FindBeadsDir()
+		if doltserver.IsSharedServerMode() {
+			fmt.Println("  Mode: shared server")
 		}
-		if beadsDir == "" {
-			os.Exit(1)
-		}
-
-		// PID file and lock management is handled inside RunIdleMonitor
-		// to ensure single-instance enforcement (GH#2367).
-
-		// Parse idle timeout from config
-		idleTimeout := doltserver.DefaultIdleTimeout
-		if v := config.GetYamlConfig("dolt.idle-timeout"); v != "" {
-			if v == "0" {
-				// Disabled
-				return
-			}
-			if d, err := time.ParseDuration(v); err == nil {
-				idleTimeout = d
-			}
-		}
-
-		// Handle SIGTERM gracefully — clean up PID file on signal
-		pidFile := filepath.Join(beadsDir, "dolt-monitor.pid")
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-		go func() {
-			<-sigCh
-			_ = os.Remove(pidFile)
-			os.Exit(0)
-		}()
-
-		doltserver.RunIdleMonitor(beadsDir, idleTimeout)
 	},
 }
 
@@ -593,7 +561,7 @@ var doltRemoteAddCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		name, url := args[0], args[1]
-		dbPath := st.Path()
+		dbPath := st.CLIDir()
 
 		// Check existing remotes on both surfaces
 		sqlRemotes, _ := st.ListRemotes(ctx)
@@ -678,7 +646,7 @@ var doltRemoteListCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "Error: no store available\n")
 			os.Exit(1)
 		}
-		dbPath := st.Path()
+		dbPath := st.CLIDir()
 
 		sqlRemotes, sqlErr := st.ListRemotes(ctx)
 		if sqlErr != nil {
@@ -789,7 +757,7 @@ var doltRemoteRemoveCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		name := args[0]
-		dbPath := st.Path()
+		dbPath := st.CLIDir()
 
 		// Check both surfaces for conflicts
 		sqlRemotes, _ := st.ListRemotes(ctx)
@@ -879,7 +847,6 @@ func init() {
 	doltStopCmd.Flags().Bool("force", false, "Force stop the server")
 	doltPushCmd.Flags().Bool("force", false, "Force push (overwrite remote changes)")
 	doltCommitCmd.Flags().StringP("message", "m", "", "Commit message (default: auto-generated)")
-	doltIdleMonitorCmd.Flags().String("beads-dir", "", "Path to .beads directory")
 	doltCleanDatabasesCmd.Flags().Bool("dry-run", false, "Show what would be dropped without dropping")
 	doltRemoteRemoveCmd.Flags().Bool("force", false, "Force remove even when SQL and CLI URLs conflict")
 	doltRemoteCmd.AddCommand(doltRemoteAddCmd)
@@ -894,7 +861,6 @@ func init() {
 	doltCmd.AddCommand(doltStartCmd)
 	doltCmd.AddCommand(doltStopCmd)
 	doltCmd.AddCommand(doltStatusCmd)
-	doltCmd.AddCommand(doltIdleMonitorCmd)
 	doltCmd.AddCommand(doltKillallCmd)
 	doltCmd.AddCommand(doltCleanDatabasesCmd)
 	doltCmd.AddCommand(doltRemoteCmd)
@@ -933,6 +899,7 @@ func showDoltConfig(testConnection bool) {
 			result["host"] = showHost
 			result["port"] = showPort
 			result["user"] = cfg.GetDoltServerUser()
+			result["shared_server"] = doltserver.IsSharedServerMode()
 			if testConnection {
 				result["connection_ok"] = testServerConnection(showHost, showPort)
 			}
@@ -952,6 +919,14 @@ func showDoltConfig(testConnection bool) {
 	fmt.Printf("  Host:     %s\n", showHost)
 	fmt.Printf("  Port:     %d\n", showPort)
 	fmt.Printf("  User:     %s\n", cfg.GetDoltServerUser())
+	if doltserver.IsSharedServerMode() {
+		fmt.Println("  Mode:     shared server")
+		if sharedDir, err := doltserver.SharedServerDir(); err == nil {
+			fmt.Printf("  Server:   %s\n", sharedDir)
+		}
+	} else {
+		fmt.Println("  Mode:     per-project")
+	}
 
 	if testConnection {
 		fmt.Println()
@@ -1076,6 +1051,19 @@ func setDoltConfig(key, value string, updateConfig bool) {
 		yamlKey = "dolt.user"
 
 	case "data-dir":
+		// GH#2438: In server mode, data-dir has no effect on which database
+		// the server connects to. Setting it silently switches the local
+		// resolution path without affecting the running server, causing
+		// commands to operate on the wrong (often empty) database.
+		if value != "" && cfg.IsDoltServerMode() {
+			fmt.Fprintf(os.Stderr, "Error: setting data-dir in server mode is not supported (GH#2438).\n")
+			fmt.Fprintf(os.Stderr, "In server mode, the database is determined by the 'database' config key,\n")
+			fmt.Fprintf(os.Stderr, "not the local data directory. Setting data-dir would silently disconnect\n")
+			fmt.Fprintf(os.Stderr, "from the configured database '%s'.\n", cfg.GetDoltDatabase())
+			fmt.Fprintf(os.Stderr, "\nTo change which database to use:\n")
+			fmt.Fprintf(os.Stderr, "  bd dolt set database <name>\n")
+			os.Exit(1)
+		}
 		if value == "" {
 			// Allow clearing the custom data dir (revert to default .beads/dolt)
 			cfg.DoltDataDir = ""
@@ -1094,9 +1082,37 @@ func setDoltConfig(key, value string, updateConfig bool) {
 		}
 		yamlKey = "dolt.data-dir"
 
+	case "shared-server":
+		lower := strings.ToLower(value)
+		if lower != "true" && lower != "false" {
+			fmt.Fprintf(os.Stderr, "Error: shared-server must be 'true' or 'false'\n")
+			os.Exit(1)
+		}
+		// shared-server is yaml-only (not stored in metadata.json)
+		if err := config.SetYamlConfig("dolt.shared-server", lower); err != nil {
+			fmt.Fprintf(os.Stderr, "Error setting shared-server: %v\n", err)
+			os.Exit(1)
+		}
+		if jsonOutput {
+			outputJSON(map[string]interface{}{
+				"key":      "shared-server",
+				"value":    lower,
+				"location": "config.yaml",
+			})
+			return
+		}
+		if lower == "true" {
+			fmt.Println("Shared server mode enabled.")
+			fmt.Println("All projects will use a single Dolt server at ~/.beads/shared-server/.")
+			fmt.Println("Each project's data remains isolated in its own database.")
+		} else {
+			fmt.Println("Shared server mode disabled. Each project will use its own Dolt server.")
+		}
+		return
+
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unknown key '%s'\n", key)
-		fmt.Fprintf(os.Stderr, "Valid keys: database, host, port, user, data-dir\n")
+		fmt.Fprintf(os.Stderr, "Valid keys: database, host, port, user, data-dir, shared-server\n")
 		os.Exit(1)
 	}
 

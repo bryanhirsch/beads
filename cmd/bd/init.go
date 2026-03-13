@@ -3,11 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -63,6 +64,8 @@ environment variable.`,
 		serverPort, _ := cmd.Flags().GetInt("server-port")
 		serverUser, _ := cmd.Flags().GetString("server-user")
 		database, _ := cmd.Flags().GetString("database")
+		destroyToken, _ := cmd.Flags().GetString("destroy-token")
+		sharedServer, _ := cmd.Flags().GetBool("shared-server")
 
 		// Handle --backend flag: "dolt" is the only supported backend.
 		// "sqlite" is accepted for backward compatibility but prints a
@@ -72,8 +75,8 @@ environment variable.`,
 			fmt.Fprintf(os.Stderr, "Dolt is now the default (and only) storage backend for beads.\n")
 			fmt.Fprintf(os.Stderr, "To initialize with Dolt:\n")
 			fmt.Fprintf(os.Stderr, "  bd init\n\n")
-			fmt.Fprintf(os.Stderr, "To migrate an existing SQLite database to Dolt:\n")
-			fmt.Fprintf(os.Stderr, "  bd migrate --to-dolt\n\n")
+			fmt.Fprintf(os.Stderr, "To import issues from an existing JSONL export:\n")
+			fmt.Fprintf(os.Stderr, "  bd init --from-jsonl\n\n")
 			fmt.Fprintf(os.Stderr, "See: https://github.com/steveyegge/beads/blob/main/docs/DOLT-BACKEND.md\n")
 			os.Exit(1)
 		} else if backendFlag != "" && backendFlag != "dolt" {
@@ -90,6 +93,13 @@ environment variable.`,
 		// Dolt is the only supported backend
 		backend := configfile.BackendDolt
 
+		// Propagate --shared-server flag to env so that IsSharedServerMode(),
+		// ResolveDoltDir(), and DefaultConfig() all see shared mode immediately
+		// (before config.yaml exists). Safe: init runs once and exits.
+		if sharedServer {
+			_ = os.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+		}
+
 		// Initialize config (PersistentPreRun doesn't run for init command)
 		if err := config.Initialize(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
@@ -104,10 +114,11 @@ environment variable.`,
 			}
 		}
 
-		// Even with --force, warn about existing data and require confirmation
-		// unless --quiet is set (which indicates programmatic/test use).
+		// Even with --force, warn about existing data and require confirmation.
+		// In non-interactive mode, accepts --destroy-token for explicit opt-in,
+		// or --quiet for legacy (deprecated) bypass.
 		// This prevents AI agents and users from accidentally destroying data.
-		if force && !quiet {
+		if force {
 			if count, err := countExistingIssues(prefix); err == nil && count > 0 {
 				fmt.Fprintf(os.Stderr, "\n%s Re-initializing will destroy the existing database.\n\n", ui.RenderWarn("WARNING:"))
 				fmt.Fprintf(os.Stderr, "  Existing issues: %d\n\n", count)
@@ -126,10 +137,19 @@ environment variable.`,
 						os.Exit(1)
 					}
 				} else {
-					// Non-interactive (piped input, AI agent, etc.) — refuse
-					fmt.Fprintf(os.Stderr, "Refusing to destroy %d issues in non-interactive mode.\n", count)
-					fmt.Fprintf(os.Stderr, "Use 'bd export' to back up first, then use --quiet to skip this check.\n")
-					os.Exit(1)
+					// Non-interactive (piped input, AI agent, etc.)
+					expectedToken := fmt.Sprintf("DESTROY-%s", prefix)
+					if destroyToken == expectedToken {
+						fmt.Fprintf(os.Stderr, "Destroy token accepted. Proceeding with re-initialization.\n")
+					} else if quiet {
+						// Legacy --quiet behavior (deprecated path)
+						fmt.Fprintf(os.Stderr, "Warning: --force --quiet bypasses safety checks. Use --destroy-token=%s instead.\n", expectedToken)
+					} else {
+						fmt.Fprintf(os.Stderr, "Refusing to destroy %d issues in non-interactive mode.\n", count)
+						fmt.Fprintf(os.Stderr, "To proceed, use: bd init --force --destroy-token=%s\n", expectedToken)
+						fmt.Fprintf(os.Stderr, "Or export first: bd export > backup.jsonl\n")
+						os.Exit(1)
+					}
 				}
 			}
 		}
@@ -265,7 +285,15 @@ environment variable.`,
 			initDBDirAbs = filepath.Clean(initDBDir)
 		}
 
-		useLocalBeads := filepath.Clean(initDBDirAbs) == filepath.Clean(beadsDirAbs)
+		// Always create local .beads/ when using default location (CWD/.beads).
+		// The local directory is needed for metadata.json, config.yaml, .gitignore,
+		// interactions.jsonl, and hooks — regardless of where dolt data lives.
+		// Only skip when BEADS_DIR explicitly points outside the project.
+		//
+		// Previous logic only created .beads/ when the dolt data dir was a
+		// subdirectory of .beads/, which broke server mode with external
+		// BEADS_DOLT_DATA_DIR or BEADS_DOLT_* env vars (GH#2519).
+		useLocalBeads := !hasExplicitBeadsDir || filepath.Clean(initDBDirAbs) == filepath.Clean(beadsDirAbs)
 
 		if useLocalBeads {
 			// Create .beads directory
@@ -378,17 +406,29 @@ environment variable.`,
 		// Build config. Beads always uses dolt sql-server.
 		// AutoStart is always enabled during init — we need a server to initialize the database.
 		//
-		// Use doltserver.DefaultConfig to resolve the port via the standard chain
-		// (env var → port file → config.yaml → DerivePort). Without this, the
-		// store's applyConfigDefaults falls back to DefaultSQLPort (3307), which
-		// may belong to a DIFFERENT project's server, causing cross-project data
-		// leakage (GH#2372).
-		doltDefaults := doltserver.DefaultConfig(beadsDir)
+		// Port resolution for init: use ONLY project-local sources (env var, port file)
+		// to prevent cross-project data leakage (GH#2336). DefaultConfig falls through
+		// to config.yaml / global config, which may resolve to another project's server
+		// because metadata.json doesn't exist yet during init. For fresh inits, port 0
+		// forces auto-start to allocate an ephemeral port for THIS project.
+		initPort := 0
+		if p := os.Getenv("BEADS_DOLT_SERVER_PORT"); p != "" {
+			if port, err := strconv.Atoi(p); err == nil && port > 0 {
+				initPort = port
+			}
+		}
+		if initPort == 0 {
+			initPort = doltserver.ReadPortFile(beadsDir)
+		}
+		// Shared server mode intentionally uses a common port for all projects.
+		if initPort == 0 && doltserver.IsSharedServerMode() {
+			initPort = doltserver.DefaultSharedServerPort
+		}
 		doltCfg := &dolt.Config{
 			Path:            storagePath,
 			BeadsDir:        beadsDir,
 			Database:        dbName,
-			ServerPort:      doltDefaults.Port,
+			ServerPort:      initPort,
 			CreateIfMissing: true, // bd init is the only path that should create databases
 			AutoStart:       os.Getenv("BEADS_DOLT_AUTO_START") != "0",
 		}
@@ -402,10 +442,16 @@ environment variable.`,
 			doltCfg.ServerUser = serverUser
 		}
 
-		var store *dolt.DoltStore
-		store, err = dolt.New(ctx, doltCfg)
+		initLock, err := acquireEmbeddedLock(beadsDir)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to connect to dolt server: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		defer initLock.Unlock()
+
+		store, err := newDoltStore(ctx, doltCfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to open Dolt store: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -492,7 +538,7 @@ environment variable.`,
 			// This UUID is stored in both metadata.json and the database,
 			// and verified on every connection to detect cross-project leakage.
 			if cfg.ProjectID == "" {
-				cfg.ProjectID = generateProjectID()
+				cfg.ProjectID = configfile.GenerateProjectID()
 			}
 
 			// Always store backend explicitly in metadata.json
@@ -544,6 +590,16 @@ environment variable.`,
 			if err := createConfigYaml(beadsDir, false, ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create config.yaml: %v\n", err)
 				// Non-fatal - continue anyway
+			}
+
+			// Enable shared server mode if requested via flag OR env var (GH#2377).
+			// Persist to config.yaml so the project continues working without the env var.
+			if sharedServer || doltserver.IsSharedServerMode() {
+				if err := config.SetYamlConfig("dolt.shared-server", "true"); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to enable shared server mode: %v\n", err)
+				} else if !quiet {
+					fmt.Printf("  %s Shared server mode enabled\n", ui.RenderPass("✓"))
+				}
 			}
 
 			// In stealth mode, persist no-git-ops: true so bd prime
@@ -810,47 +866,61 @@ environment variable.`,
 			fmt.Printf("\n%s bd initialized successfully!\n\n", ui.RenderPass("✓"))
 		}
 		fmt.Printf("  Backend: %s\n", ui.RenderAccent(backend))
-		host := serverHost
-		if host == "" {
-			host = configfile.DefaultDoltServerHost
+		if isEmbeddedDolt {
+			fmt.Printf("  Mode: %s\n", ui.RenderAccent("embedded"))
+		} else {
+			host := serverHost
+			if host == "" {
+				host = configfile.DefaultDoltServerHost
+			}
+			port := serverPort
+			if port == 0 {
+				port = doltserver.DefaultConfig(beadsDir).Port
+			}
+			user := serverUser
+			if user == "" {
+				user = configfile.DefaultDoltServerUser
+			}
+			fmt.Printf("  Mode: %s\n", ui.RenderAccent("server"))
+			fmt.Printf("  Server: %s\n", ui.RenderAccent(fmt.Sprintf("%s@%s:%d", user, host, port)))
 		}
-		port := serverPort
-		if port == 0 {
-			port = doltserver.DefaultConfig(beadsDir).Port
-		}
-		user := serverUser
-		if user == "" {
-			user = configfile.DefaultDoltServerUser
-		}
-		fmt.Printf("  Mode: %s\n", ui.RenderAccent("server"))
-		fmt.Printf("  Server: %s\n", ui.RenderAccent(fmt.Sprintf("%s@%s:%d", user, host, port)))
 		fmt.Printf("  Database: %s\n", ui.RenderAccent(dbName))
 		fmt.Printf("  Issue prefix: %s\n", ui.RenderAccent(prefix))
 		fmt.Printf("  Issues will be named: %s\n\n", ui.RenderAccent(prefix+"-<hash> (e.g., "+prefix+"-a3f2dd)"))
 		fmt.Printf("Run %s to get started.\n\n", ui.RenderAccent("bd quickstart"))
 
-		// Run limited diagnostics to verify init succeeded.
-		// Uses runInitDiagnostics (not runDiagnostics) to only check things
-		// that should be true immediately after init — skips git-dependent,
-		// federation, and other post-setup checks that aren't applicable yet.
-		doctorResult := runInitDiagnostics(cwd)
-		// Check if there are any warnings or errors (not just critical failures)
-		hasIssues := false
-		for _, check := range doctorResult.Checks {
-			if check.Status != statusOK {
-				hasIssues = true
-				break
-			}
+		// Detect backup files from a previous session (GH#2327).
+		// This catches the branch-switch scenario: user ran bd init on a new
+		// branch and the database was created fresh, but backup JSONL files
+		// exist from a prior backup on this or another branch.
+		if !bootstrappedFromRemote && dolt.HasBackupFiles(beadsDir) {
+			fmt.Printf("  %s Backup files detected in .beads/backup/\n", ui.RenderWarn("!"))
+			fmt.Printf("    To restore issues from a previous backup, run:\n")
+			fmt.Printf("      %s\n\n", ui.RenderAccent("bd backup restore"))
 		}
-		if hasIssues {
-			fmt.Printf("%s Setup incomplete. Some issues were detected:\n", ui.RenderWarn("⚠"))
-			// Show just the warnings/errors, not all checks
+
+		// Run limited diagnostics to verify init succeeded.
+		// Skipped in embedded mode: diagnostics use dolt.NewFromConfigWithOptions
+		// which auto-starts a dolt sql-server. Embedded init already validates
+		// the database via initSchema.
+		if !isEmbeddedDolt {
+			doctorResult := runInitDiagnostics(cwd)
+			hasIssues := false
 			for _, check := range doctorResult.Checks {
 				if check.Status != statusOK {
-					fmt.Printf("  • %s: %s\n", check.Name, check.Message)
+					hasIssues = true
+					break
 				}
 			}
-			fmt.Printf("\nRun %s to see details and fix these issues.\n\n", ui.RenderAccent("bd doctor --fix"))
+			if hasIssues {
+				fmt.Printf("%s Setup incomplete. Some issues were detected:\n", ui.RenderWarn("⚠"))
+				for _, check := range doctorResult.Checks {
+					if check.Status != statusOK {
+						fmt.Printf("  • %s: %s\n", check.Name, check.Message)
+					}
+				}
+				fmt.Printf("\nRun %s to see details and fix these issues.\n\n", ui.RenderAccent("bd doctor --fix"))
+			}
 		}
 	},
 }
@@ -865,6 +935,7 @@ func init() {
 	initCmd.Flags().Bool("skip-hooks", false, "Skip git hooks installation")
 	initCmd.Flags().Bool("force", false, "Force re-initialization even if database already has issues (may cause data loss)")
 	initCmd.Flags().Bool("from-jsonl", false, "Import issues from .beads/issues.jsonl instead of git history")
+	initCmd.Flags().String("destroy-token", "", "Explicit confirmation token for destructive re-init in non-interactive mode (format: 'DESTROY-<prefix>')")
 	initCmd.Flags().String("agents-template", "", "Path to custom AGENTS.md template (overrides embedded default)")
 
 	// Backend selection (dolt is the only supported backend; sqlite accepted for deprecation notice)
@@ -876,6 +947,7 @@ func init() {
 	initCmd.Flags().Int("server-port", 0, "Dolt server port (default: 3307)")
 	initCmd.Flags().String("server-user", "", "Dolt server MySQL user (default: root)")
 	initCmd.Flags().String("database", "", "Use existing server database name (overrides prefix-based naming)")
+	initCmd.Flags().Bool("shared-server", false, "Enable shared Dolt server mode (all projects share one server at ~/.beads/shared-server/)")
 
 	rootCmd.AddCommand(initCmd)
 }
@@ -970,12 +1042,21 @@ func checkExistingBeadsDataAt(beadsDir string, prefix string) error {
 
 				result := checkDatabaseOnServer(host, port, user, password, dbName)
 				if result.Reachable && !result.Exists && result.Err == nil {
-					// Server up but DB missing — show refined message (FR-010, FR-011).
-					gitRemote := config.GetString("sync.git-remote")
-					return initGuardServerMessage(dbName, host, port, prefix, gitRemote)
+					// Server is up but DB doesn't exist. Since we also know
+					// doltDirExists==false, this is a fresh clone — there's no
+					// local database to protect. Allow init to proceed so the
+					// user can bootstrap (e.g. via --from-jsonl). (GH#2433)
+					return nil
 				}
-				// If server unreachable (FR-030) or DB exists (FR-012) or
-				// error during check: fall through to existing behavior.
+				if result.Reachable && result.Exists {
+					// Server up and DB exists — fall through to "already initialized" error.
+				} else {
+					// Server unreachable or error during check: this is a fresh clone
+					// with committed metadata.json but no local dolt/ directory.
+					// Allow init to proceed so the user can bootstrap the database
+					// (e.g. via --from-jsonl). (GH#2433)
+					return nil
+				}
 			}
 
 			location := doltPath
@@ -1065,7 +1146,7 @@ func countExistingIssues(_ string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+	store, err := newDoltStoreFromConfig(ctx, beadsDir)
 	if err != nil {
 		return 0, err
 	}
@@ -1208,20 +1289,7 @@ func promptContributorMode() (isContributor bool, err error) {
 
 // verifyMetadata writes a metadata field and verifies the write succeeded.
 // Returns true if write+verify succeeded, false with warning if either failed.
-// generateProjectID creates a UUID v4 for project identity verification.
-func generateProjectID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// Fallback: use timestamp + PID as a unique-enough identifier
-		return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
-	}
-	// Set version (4) and variant (RFC 4122)
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-func verifyMetadata(ctx context.Context, store *dolt.DoltStore, key, value string) bool {
+func verifyMetadata(ctx context.Context, store storage.DoltStorage, key, value string) bool {
 	if err := store.SetMetadata(ctx, key, value); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write %s metadata: %v\n", key, err)
 		fmt.Fprintf(os.Stderr, "  Run 'bd doctor --fix' to repair.\n")

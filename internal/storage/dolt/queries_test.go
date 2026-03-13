@@ -616,7 +616,7 @@ func TestGetBlockedIssues_IncludesChildrenOfBlockedParents(t *testing.T) {
 		Title:     "Prerequisite",
 		Status:    types.StatusOpen,
 		Priority:  1,
-		IssueType: types.TypeTask,
+		IssueType: types.TypeEpic, // must match blocked type for DepBlocks (GH#1495)
 	}
 	epic := &types.Issue{
 		ID:        "bi-epic",
@@ -787,6 +787,64 @@ func TestSearchIssues_ByDescription(t *testing.T) {
 	}
 	if results[0].ID != issue.ID {
 		t.Errorf("expected issue %s, got %s", issue.ID, results[0].ID)
+	}
+}
+
+// TestSearchIssues_ByExternalRef verifies two things:
+//  1. A free-text query like "BE-1521" (which looksLikeIssueID returns true for)
+//     matches an issue whose external_ref contains that string.
+//  2. The ExternalRefContains filter works for explicit substring search.
+func TestSearchIssues_ByExternalRef(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	linearURL := "https://linear.app/example-org/issue/BE-1521"
+	issue := &types.Issue{
+		ID:          "si-extref-xyz",
+		Title:       "Migrate EmailUtils across all services",
+		ExternalRef: &linearURL,
+		Status:      types.StatusOpen,
+		Priority:    3,
+		IssueType:   types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("failed to create issue: %v", err)
+	}
+
+	// Free-text ID-like query should match via external_ref LIKE.
+	results, err := store.SearchIssues(ctx, "BE-1521", types.IssueFilter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("free-text search for external ref id: expected 1 result, got %d", len(results))
+	}
+	if results[0].ID != issue.ID {
+		t.Errorf("expected %s, got %s", issue.ID, results[0].ID)
+	}
+
+	// ExternalRefContains filter should also find it.
+	results, err = store.SearchIssues(ctx, "", types.IssueFilter{ExternalRefContains: "BE-1521"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("ExternalRefContains filter: expected 1 result, got %d", len(results))
+	}
+	if results[0].ID != issue.ID {
+		t.Errorf("expected %s, got %s", issue.ID, results[0].ID)
+	}
+
+	// Unrelated query should not match.
+	results, err = store.SearchIssues(ctx, "BE-9999", types.IssueFilter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no results for unrelated external ref, got %d", len(results))
 	}
 }
 

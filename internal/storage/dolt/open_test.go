@@ -1,7 +1,14 @@
 package dolt
 
 import (
+	"bytes"
+	"io"
+	"os"
+	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltserver"
 )
 
 // TestResolveAutoStart verifies all conditions that govern the AutoStart decision.
@@ -96,4 +103,127 @@ func TestResolveAutoStart(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyResolvedConfig(t *testing.T) {
+	t.Run("fills server config for legacy metadata without dolt_mode", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		fileCfg := &configfile.Config{
+			Backend:      configfile.BackendDolt,
+			DoltDatabase: "beads_codex",
+			ProjectID:    "proj-123",
+		}
+		cfg := &Config{}
+
+		applyResolvedConfig(beadsDir, fileCfg, cfg)
+
+		if cfg.BeadsDir != beadsDir {
+			t.Fatalf("BeadsDir = %q, want %q", cfg.BeadsDir, beadsDir)
+		}
+		if cfg.Path != fileCfg.DatabasePath(beadsDir) {
+			t.Fatalf("Path = %q, want %q", cfg.Path, fileCfg.DatabasePath(beadsDir))
+		}
+		if cfg.Database != "beads_codex" {
+			t.Fatalf("Database = %q, want beads_codex", cfg.Database)
+		}
+		if cfg.ServerHost != fileCfg.GetDoltServerHost() {
+			t.Fatalf("ServerHost = %q, want %q", cfg.ServerHost, fileCfg.GetDoltServerHost())
+		}
+		if cfg.ServerUser != fileCfg.GetDoltServerUser() {
+			t.Fatalf("ServerUser = %q, want %q", cfg.ServerUser, fileCfg.GetDoltServerUser())
+		}
+		wantPort := doltserver.DefaultConfig(beadsDir).Port
+		if cfg.ServerPort != wantPort {
+			t.Fatalf("ServerPort = %d, want %d", cfg.ServerPort, wantPort)
+		}
+	})
+
+	t.Run("warns when data-dir set in server mode (GH#2438)", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		fileCfg := &configfile.Config{
+			Backend:      configfile.BackendDolt,
+			DoltMode:     configfile.DoltModeServer,
+			DoltDatabase: "beads_CodeWriter7",
+			DoltDataDir:  "/some/stale/path",
+		}
+		cfg := &Config{}
+
+		// Capture stderr to verify warning
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+
+		applyResolvedConfig(beadsDir, fileCfg, cfg)
+
+		w.Close()
+		os.Stderr = oldStderr
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+
+		output := buf.String()
+		if !strings.Contains(output, "dolt_data_dir is set") {
+			t.Errorf("expected data-dir warning in server mode, got: %q", output)
+		}
+		if !strings.Contains(output, "server mode") {
+			t.Errorf("expected 'server mode' in warning, got: %q", output)
+		}
+	})
+
+	t.Run("no warning when data-dir empty in server mode", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		fileCfg := &configfile.Config{
+			Backend:      configfile.BackendDolt,
+			DoltMode:     configfile.DoltModeServer,
+			DoltDatabase: "beads_CodeWriter7",
+		}
+		cfg := &Config{}
+
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+
+		applyResolvedConfig(beadsDir, fileCfg, cfg)
+
+		w.Close()
+		os.Stderr = oldStderr
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+
+		if buf.Len() > 0 {
+			t.Errorf("expected no warning when data-dir is empty, got: %q", buf.String())
+		}
+	})
+
+	t.Run("preserves caller overrides", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		fileCfg := &configfile.Config{
+			Backend:      configfile.BackendDolt,
+			DoltDatabase: "beads_codex",
+		}
+		cfg := &Config{
+			BeadsDir:   "/override/.beads",
+			Database:   "caller_db",
+			ServerHost: "10.0.0.9",
+			ServerPort: 15432,
+			ServerUser: "custom",
+		}
+
+		applyResolvedConfig(beadsDir, fileCfg, cfg)
+
+		if cfg.BeadsDir != "/override/.beads" {
+			t.Fatalf("BeadsDir override lost: %q", cfg.BeadsDir)
+		}
+		if cfg.Database != "caller_db" {
+			t.Fatalf("Database override lost: %q", cfg.Database)
+		}
+		if cfg.ServerHost != "10.0.0.9" {
+			t.Fatalf("ServerHost override lost: %q", cfg.ServerHost)
+		}
+		if cfg.ServerPort != 15432 {
+			t.Fatalf("ServerPort override lost: %d", cfg.ServerPort)
+		}
+		if cfg.ServerUser != "custom" {
+			t.Fatalf("ServerUser override lost: %q", cfg.ServerUser)
+		}
+	})
 }

@@ -31,14 +31,14 @@ func handleFreshCloneError(err error) bool {
 
 	fmt.Fprintf(os.Stderr, "Error: Database not initialized\n\n")
 	fmt.Fprintf(os.Stderr, "This appears to be a fresh clone or the database needs initialization.\n")
-	fmt.Fprintf(os.Stderr, "\nTo initialize a new database, run:\n")
-	fmt.Fprintf(os.Stderr, "  bd init --prefix <your-prefix>\n\n")
-	fmt.Fprintf(os.Stderr, "For more information: bd init --help\n")
+	fmt.Fprintf(os.Stderr, "\nTo diagnose, run:\n")
+	fmt.Fprintf(os.Stderr, "  bd doctor\n\n")
+	fmt.Fprintf(os.Stderr, "To initialize a new database: bd init --prefix <your-prefix>\n")
 	return true
 }
 
 // isWispOperation returns true if the command operates on ephemeral wisps.
-// Wisp operations auto-bypass the daemon because wisps are local-only.
+// Wisp operations use direct store access (local-only).
 // Detects:
 //   - mol wisp subcommands (create, list, gc, or direct proto invocation)
 //   - mol burn (only operates on wisps)

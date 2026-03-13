@@ -1,12 +1,14 @@
 package configfile
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const ConfigFileName = "metadata.json"
@@ -19,7 +21,7 @@ type Config struct {
 	DeletionsRetentionDays int `json:"deletions_retention_days,omitempty"` // 0 means use default (3 days)
 
 	// Dolt connection mode configuration (bd-dolt.2.2)
-	// "embedded" (default for standalone) runs Dolt in-process — no daemon needed.
+	// "embedded" (default for standalone) runs Dolt in-process.
 	// "server" connects to an external dolt sql-server (required for Gas Town / multi-writer).
 	DoltMode           string `json:"dolt_mode,omitempty"`            // "embedded" (default) or "server"
 	DoltServerHost     string `json:"dolt_server_host,omitempty"`     // Server host (default: 127.0.0.1)
@@ -254,13 +256,19 @@ func (c *Config) GetDoltServerHost() string {
 
 // Deprecated: Use doltserver.DefaultConfig(beadsDir).Port instead.
 // This method falls back to 3307 which is wrong for standalone mode
-// (where the port is hash-derived from the project path).
+// (where the port is an OS-assigned ephemeral port).
 // Kept for backward compatibility with external consumers.
 //
 // GetDoltServerPort returns the Dolt server port.
-// Checks BEADS_DOLT_SERVER_PORT env var first, then config, then default.
+// Checks BEADS_DOLT_SERVER_PORT env var first, then BEADS_DOLT_PORT (Gas Town sets this),
+// then config, then default.
 func (c *Config) GetDoltServerPort() int {
 	if p := os.Getenv("BEADS_DOLT_SERVER_PORT"); p != "" {
+		if port, err := strconv.Atoi(p); err == nil {
+			return port
+		}
+	}
+	if p := os.Getenv("BEADS_DOLT_PORT"); p != "" {
 		if port, err := strconv.Atoi(p); err == nil {
 			return port
 		}
@@ -335,4 +343,17 @@ func (c *Config) GetDoltRemotesAPIPort() int {
 		return c.DoltRemotesAPIPort
 	}
 	return DefaultDoltRemotesAPIPort
+}
+
+// GenerateProjectID creates a UUID v4 for project identity verification (GH#2372).
+func GenerateProjectID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback: use timestamp + PID as a unique-enough identifier
+		return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	}
+	// Set version (4) and variant (RFC 4122)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

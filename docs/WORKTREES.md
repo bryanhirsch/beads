@@ -16,7 +16,9 @@ Beads now provides **enhanced Git worktree support** with a shared database arch
 
 ### Why Beads Creates Worktrees
 
-When you configure a **sync branch** (via `bd init --branch <name>` or `bd config set sync.branch <name>`), beads needs to commit issue updates to that branch without switching your working directory away from your current branch.
+**Note:** The sync-branch feature has been removed. Dolt now stores data under `refs/dolt/data`, separate from standard Git refs, so a separate branch is no longer needed. The information below applies only to older versions of beads.
+
+When a **sync branch** was configured (via `bd config set sync.branch <name>`), beads needed to commit issue updates to that branch without switching your working directory away from your current branch.
 
 **Solution:** Beads creates a lightweight worktree that:
 - Contains only the `.beads/` directory (sparse checkout)
@@ -126,7 +128,7 @@ Main Repository
 bd automatically detects when you're in a git worktree:
 
 **Default behavior (no sync-branch configured):**
-- Uses embedded mode for safety (single-writer, no daemon needed)
+- Uses embedded mode for safety (single-writer, no server needed)
 - All commands work correctly without additional setup
 
 **With sync-branch configured:**
@@ -155,7 +157,7 @@ bd ready  # Auto-syncs to beads-sync branch
 cd feature-worktree
 bd create "Implement feature X" -t feature -p 1
 bd ready  # Uses embedded mode automatically
-bd sync   # Manual sync when needed
+bd dolt push   # Manual sync when needed
 ```
 
 ## Worktree-Aware Features
@@ -264,7 +266,7 @@ bd config set sync.branch ""
 
 **Symptoms:** You notice `.git/beads-worktrees/` or entries in `.git/worktrees/` that you didn't create.
 
-**Cause:** Beads automatically creates worktrees when using the sync-branch feature (configured via `bd init --branch` or `bd config set sync.branch`).
+**Cause:** Older versions of beads created worktrees for the sync-branch feature (configured via `bd config set sync.branch`). This feature has been removed.
 
 **Solution:** See [Beads-Created Worktrees](#beads-created-worktrees-sync-branch) section above for details on what these are and how to remove them if unwanted.
 
@@ -455,7 +457,7 @@ export BEADS_DIR=~/my-project-beads/.beads
 # All bd commands now use the separate repo
 bd create "My task" -t task
 bd list
-bd sync  # commits to ~/my-project-beads, pushes there
+bd dolt push  # commits to ~/my-project-beads, pushes there
 ```
 
 ### Making It Permanent
@@ -483,7 +485,7 @@ BEADS_DIR=~/my-project-beads/.beads exec bd "$@"
 
 When `BEADS_DIR` points to a different git repository than your current directory:
 
-1. `bd sync` detects "External BEADS_DIR"
+1. `bd dolt push` detects "External BEADS_DIR"
 2. Git operations (add, commit, push, pull) target the beads repo
 3. Your code repository is never touched
 

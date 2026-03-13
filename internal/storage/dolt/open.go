@@ -31,30 +31,7 @@ func NewFromConfigWithOptions(ctx context.Context, beadsDir string, cfg *Config)
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	cfg.Path = fileCfg.DatabasePath(beadsDir)
-	if cfg.BeadsDir == "" {
-		cfg.BeadsDir = beadsDir
-	}
-
-	// Always apply database name from metadata.json (prefix-based naming, bd-u8rda).
-	if cfg.Database == "" {
-		cfg.Database = fileCfg.GetDoltDatabase()
-	}
-
-	// Merge server connection config (config provides defaults, caller can override)
-	if fileCfg.IsDoltServerMode() {
-		if cfg.ServerHost == "" {
-			cfg.ServerHost = fileCfg.GetDoltServerHost()
-		}
-		if cfg.ServerPort == 0 {
-			// Use doltserver.DefaultConfig for port resolution (env > config > DerivePort).
-			// fileCfg.GetDoltServerPort() falls back to 3307 which is wrong for standalone mode.
-			cfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
-		}
-		if cfg.ServerUser == "" {
-			cfg.ServerUser = fileCfg.GetDoltServerUser()
-		}
-	}
+	applyResolvedConfig(beadsDir, fileCfg, cfg)
 
 	// Enable auto-start for standalone users (similar to main.go's auto-start
 	// handling), with additional support for BEADS_TEST_MODE and a config.yaml
@@ -133,4 +110,41 @@ func GetBackendFromConfig(beadsDir string) string {
 		return configfile.BackendDolt
 	}
 	return cfg.GetBackend()
+}
+
+// applyResolvedConfig merges metadata.json-derived defaults into a store config.
+// Server connection fields are always populated because the storage layer is
+// server-backed even when older metadata.json files omit dolt_mode.
+func applyResolvedConfig(beadsDir string, fileCfg *configfile.Config, cfg *Config) {
+	cfg.Path = fileCfg.DatabasePath(beadsDir)
+	if cfg.BeadsDir == "" {
+		cfg.BeadsDir = beadsDir
+	}
+
+	// GH#2438: Warn if data-dir is set in server mode — it has no effect on
+	// which database the server uses and can cause silent DB context switches.
+	if fileCfg.DoltDataDir != "" && fileCfg.IsDoltServerMode() {
+		fmt.Fprintf(os.Stderr, "Warning: dolt_data_dir is set (%s) but Dolt is in server mode.\n", fileCfg.DoltDataDir)
+		fmt.Fprintf(os.Stderr, "In server mode, data-dir does not control which database is used.\n")
+		fmt.Fprintf(os.Stderr, "This may cause commands to operate on the wrong database.\n")
+		fmt.Fprintf(os.Stderr, "Fix: bd dolt set data-dir ''   (clear the data-dir setting)\n\n")
+	}
+
+	// Always apply database name from metadata.json (prefix-based naming, bd-u8rda).
+	if cfg.Database == "" {
+		cfg.Database = fileCfg.GetDoltDatabase()
+	}
+
+	if cfg.ServerHost == "" {
+		cfg.ServerHost = fileCfg.GetDoltServerHost()
+	}
+	if cfg.ServerPort == 0 {
+		// Use doltserver.DefaultConfig for port resolution (env > port file >
+		// config.yaml > metadata > DerivePort). fileCfg.GetDoltServerPort()
+		// falls back to 3307 which is wrong for standalone repos.
+		cfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
+	}
+	if cfg.ServerUser == "" {
+		cfg.ServerUser = fileCfg.GetDoltServerUser()
+	}
 }
