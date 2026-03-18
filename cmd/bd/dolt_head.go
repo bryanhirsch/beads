@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
@@ -26,8 +27,9 @@ var lastWrittenRefs string
 //	.beads/refs/heads/<branch>   ← "<dolt-commit-hash>"
 //
 // Called after every Dolt commit (auto-commit and explicit).
-func writeBeadsRefs(ctx context.Context, s *dolt.DoltStore) {
-	if s == nil || s.IsClosed() {
+func writeBeadsRefs(ctx context.Context, si storage.DoltStorage) {
+	s, ok := si.(*dolt.DoltStore)
+	if !ok || s == nil || s.IsClosed() {
 		return
 	}
 	if !config.IsBranchStrategyEnabled() {
@@ -124,15 +126,16 @@ func readBeadsRefs(beadsDir string) (commitHash, branch string) {
 //	prompt=false, reset=true  → auto-reset, message to stderr
 //	prompt=true,  reset=false → prompt [y/N], default keeps current state
 //	prompt=true,  reset=true  → prompt [Y/n], default resets
-func checkBeadsRefSync(ctx context.Context, s *dolt.DoltStore) {
-	checkBeadsRefSyncWithGitLine(ctx, s, "")
+func checkBeadsRefSync(ctx context.Context, si storage.DoltStorage) {
+	checkBeadsRefSyncWithGitLine(ctx, si, "")
 }
 
 // checkBeadsRefSyncWithGitLine compares .beads/refs against the current Dolt state and
 // takes action based on branch_strategy.* settings. When gitResetLine is non-empty
 // (from bd reset), it's included in the prompt for context.
-func checkBeadsRefSyncWithGitLine(ctx context.Context, s *dolt.DoltStore, gitResetLine string) {
-	if s == nil || s.IsClosed() {
+func checkBeadsRefSyncWithGitLine(ctx context.Context, si storage.DoltStorage, gitResetLine string) {
+	s, ok := si.(*dolt.DoltStore)
+	if !ok || s == nil || s.IsClosed() {
 		return
 	}
 

@@ -62,7 +62,7 @@ Examples:
 		}
 
 		// Immediately check refs for mismatch
-		if store != nil && !store.IsClosed() {
+		if store != nil {
 			checkBeadsRefSyncWithGitLine(rootCtx, store, gitResetLine)
 		}
 	},
@@ -94,7 +94,7 @@ Useful for shell integration:
 			fmt.Fprintf(os.Stderr, "beads: refs disabled (no branch_strategy section in config.yaml)\n")
 			return
 		}
-		if store != nil && !store.IsClosed() {
+		if store != nil {
 			checkBeadsRefSync(rootCtx, store)
 		}
 	},
