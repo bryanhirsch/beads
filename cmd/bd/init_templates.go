@@ -65,6 +65,29 @@ func createConfigYaml(beadsDir string, noDbMode bool, prefix string) error {
 #     - ~/beads-planning  # Personal planning repo
 #     - ~/work-planning   # Work planning repo
 
+# Branch strategy (git-dolt history correspondence)
+#
+# OFF by default. Uncomment the branch_strategy section to enable.
+# When off, no .beads/HEAD or .beads/refs/ files are generated,
+# this means beads' commit history in dolt will remain
+# separate from the code's git history.
+#
+# When on, git commits' corresponding dolt commits are tracked in
+# .beads/HEAD and .beads/refs/ files. This makes it possible to give
+# the user the option of resetting both git and
+# dolt to the same point in history.
+#
+# More settings and capabilities coming soon, per roadmap here:
+# https://gist.github.com/bryanhirsch/5f003918e13a079975a27b5f7346fc37
+#
+# And discussion here:
+# https://github.com/steveyegge/beads/discussions/2362
+#
+# branch_strategy:
+#   prompt: true                         # Prompt to select strategy (true = interactive; false = follow default strategies, silently skipping prompts)
+#   defaults:
+#     reset_dolt_with_git: false         # Reset dolt history with git reset
+
 # JSONL backup (periodic export for off-machine recovery)
 # Auto-enabled when a git remote exists. Override explicitly:
 # backup:

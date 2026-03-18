@@ -287,4 +287,93 @@ func TestImportFromLocalJSONL(t *testing.T) {
 			t.Errorf("Expected auto-detected prefix 'myprefix', got %q", prefix)
 		}
 	})
+
+	t.Run("re-import does not duplicate comments", func(t *testing.T) {
+		// Comments use a UUID PK (DEFAULT UUID()), so a naive INSERT would create
+		// duplicates on every re-import. PersistComments must deduplicate
+		// by checking (issue_id, author, created_at) before inserting.
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "dolt")
+		store := newTestStore(t, dbPath)
+
+		jsonlContent := `{"id":"test-cmt1","title":"Issue with comments","type":"task","status":"open","priority":2,"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z","comments":[{"author":"alice","text":"First comment","created_at":"2025-01-01T12:00:00Z"},{"author":"bob","text":"Second comment","created_at":"2025-01-01T13:00:00Z"}]}
+`
+		jsonlPath := filepath.Join(tmpDir, "issues.jsonl")
+		if err := os.WriteFile(jsonlPath, []byte(jsonlContent), 0644); err != nil {
+			t.Fatalf("Failed to write JSONL file: %v", err)
+		}
+
+		ctx := context.Background()
+
+		// First import
+		count, err := importFromLocalJSONL(ctx, store, jsonlPath)
+		if err != nil {
+			t.Fatalf("first import failed: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("Expected 1 issue imported, got %d", count)
+		}
+
+		// Second import — same data
+		count2, err := importFromLocalJSONL(ctx, store, jsonlPath)
+		if err != nil {
+			t.Fatalf("second import failed: %v", err)
+		}
+		if count2 != 1 {
+			t.Errorf("Expected 1 issue on re-import, got %d", count2)
+		}
+
+		// Verify comments were NOT duplicated
+		issue, err := store.GetIssue(ctx, "test-cmt1")
+		if err != nil {
+			t.Fatalf("Failed to get issue: %v", err)
+		}
+		if len(issue.Comments) != 2 {
+			t.Errorf("Expected 2 comments after re-import, got %d (duplicates!)", len(issue.Comments))
+		}
+	})
+
+	t.Run("no_history flag survives JSONL import roundtrip", func(t *testing.T) {
+		// Regression test for GH#2619: ImportFromLocalJSONL must preserve no_history=true.
+		// NoHistory beads are stored in the wisps table with no_history=1. The issueops
+		// InsertIssueIntoTable function must include no_history in the INSERT or the flag
+		// is silently dropped and the bead becomes GC-eligible after restore.
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "dolt")
+		store := newTestStore(t, dbPath)
+
+		// JSONL line with no_history=true (and ephemeral=false).
+		// This represents a NoHistory bead exported from a live database.
+		jsonlContent := `{"id":"test-nh1","title":"NoHistory bead","type":"task","status":"open","priority":2,"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z","no_history":true}
+`
+		jsonlPath := filepath.Join(tmpDir, "issues.jsonl")
+		if err := os.WriteFile(jsonlPath, []byte(jsonlContent), 0644); err != nil {
+			t.Fatalf("Failed to write JSONL file: %v", err)
+		}
+
+		ctx := context.Background()
+		count, err := importFromLocalJSONL(ctx, store, jsonlPath)
+		if err != nil {
+			t.Fatalf("importFromLocalJSONL failed: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("Expected 1 issue imported, got %d", count)
+		}
+
+		// Verify the bead was imported with no_history=true preserved.
+		issue, err := store.GetIssue(ctx, "test-nh1")
+		if err != nil {
+			t.Fatalf("Failed to get NoHistory bead after import: %v", err)
+		}
+		if issue.Title != "NoHistory bead" {
+			t.Errorf("Expected title 'NoHistory bead', got %q", issue.Title)
+		}
+		if !issue.NoHistory {
+			t.Error("no_history=true was lost during JSONL import: bead is now GC-eligible (would be incorrectly collected by wisp GC)")
+		}
+		// NoHistory beads must NOT have ephemeral=true (they're not GC-eligible)
+		if issue.Ephemeral {
+			t.Error("NoHistory bead must not be ephemeral=true after import")
+		}
+	})
 }

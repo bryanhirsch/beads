@@ -1,12 +1,14 @@
 package beads
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
 )
 
@@ -139,6 +141,128 @@ func TestFindDatabasePathNotFound(t *testing.T) {
 	// Result might be the home directory default if it exists, or empty string
 	// Just verify it doesn't error
 	_ = result
+}
+
+// TestFindDatabasePath_BEADS_DB_Directory tests that FindDatabasePath behaves
+// correctly when BEADS_DB points to a directory (like .beads/) rather than a
+// .db file. This is a regression test for a bug where main.go:476 does
+// beadsDir := filepath.Dir(dbPath), which resolves one level too high when
+// dbPath is a directory.
+//
+// With BEADS_DIR, FindDatabasePath returns .beads/dolt (a path inside .beads/),
+// so filepath.Dir() correctly yields .beads/. But with BEADS_DB pointing to
+// .beads/, it returns .beads/ itself, so filepath.Dir() yields the parent —
+// causing stray dolt/ directories and broken server connections.
+func TestFindDatabasePath_BEADS_DB_Directory(t *testing.T) {
+	// Save original env vars
+	originalDB := os.Getenv("BEADS_DB")
+	originalDir := os.Getenv("BEADS_DIR")
+	defer func() {
+		if originalDB != "" {
+			os.Setenv("BEADS_DB", originalDB)
+		} else {
+			os.Unsetenv("BEADS_DB")
+		}
+		if originalDir != "" {
+			os.Setenv("BEADS_DIR", originalDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+	}()
+
+	// Create a .beads/ directory with dolt/ inside, mimicking a real project
+	tmpDir, err := os.MkdirTemp("", "beads-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	doltDir := filepath.Join(beadsDir, "dolt")
+	if err := os.MkdirAll(doltDir, 0o750); err != nil {
+		t.Fatalf("Failed to create dolt dir: %v", err)
+	}
+
+	// Resolve symlinks for comparison (macOS /var → /private/var)
+	beadsDirResolved, err := filepath.EvalSymlinks(beadsDir)
+	if err != nil {
+		beadsDirResolved = beadsDir
+	}
+
+	// Test with BEADS_DIR — this works correctly
+	os.Unsetenv("BEADS_DB")
+	os.Setenv("BEADS_DIR", beadsDir)
+	resultDir := FindDatabasePath()
+	resultDirResolved, _ := filepath.EvalSymlinks(resultDir)
+	derivedFromDir := filepath.Dir(resultDirResolved)
+	if derivedFromDir != beadsDirResolved {
+		t.Errorf("BEADS_DIR: filepath.Dir(FindDatabasePath()) = %q, want %q",
+			derivedFromDir, beadsDirResolved)
+	}
+
+	// Test with BEADS_DB pointing to the same directory — this is the bug.
+	// FindDatabasePath returns .beads/ itself (not .beads/dolt), so
+	// filepath.Dir() yields the parent directory instead of .beads/.
+	os.Unsetenv("BEADS_DIR")
+	os.Setenv("BEADS_DB", beadsDir)
+	resultDB := FindDatabasePath()
+	resultDBResolved, _ := filepath.EvalSymlinks(resultDB)
+	derivedFromDB := filepath.Dir(resultDBResolved)
+	if derivedFromDB != beadsDirResolved {
+		t.Errorf("BEADS_DB (directory): filepath.Dir(FindDatabasePath()) = %q, want %q\n"+
+			"FindDatabasePath returned %q — should return a path inside .beads/, not .beads/ itself",
+			derivedFromDB, beadsDirResolved, resultDBResolved)
+	}
+}
+
+// TestFindDatabasePath_BEADS_DB_DirectoryTrailingSlash verifies that a
+// trailing slash on BEADS_DB doesn't change the outcome — path canonicalization
+// strips it, so the same filepath.Dir() bug applies.
+func TestFindDatabasePath_BEADS_DB_DirectoryTrailingSlash(t *testing.T) {
+	originalDB := os.Getenv("BEADS_DB")
+	originalDir := os.Getenv("BEADS_DIR")
+	defer func() {
+		if originalDB != "" {
+			os.Setenv("BEADS_DB", originalDB)
+		} else {
+			os.Unsetenv("BEADS_DB")
+		}
+		if originalDir != "" {
+			os.Setenv("BEADS_DIR", originalDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+	}()
+
+	tmpDir, err := os.MkdirTemp("", "beads-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	doltDir := filepath.Join(beadsDir, "dolt")
+	if err := os.MkdirAll(doltDir, 0o750); err != nil {
+		t.Fatalf("Failed to create dolt dir: %v", err)
+	}
+
+	beadsDirResolved, err := filepath.EvalSymlinks(beadsDir)
+	if err != nil {
+		beadsDirResolved = beadsDir
+	}
+
+	// Set BEADS_DB with trailing slash
+	os.Unsetenv("BEADS_DIR")
+	os.Setenv("BEADS_DB", beadsDir+string(filepath.Separator))
+
+	result := FindDatabasePath()
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	derived := filepath.Dir(resultResolved)
+	if derived != beadsDirResolved {
+		t.Errorf("BEADS_DB (trailing slash): filepath.Dir(FindDatabasePath()) = %q, want %q\n"+
+			"FindDatabasePath returned %q",
+			derived, beadsDirResolved, resultResolved)
+	}
 }
 
 // TestHasBeadsProjectFiles verifies that hasBeadsProjectFiles correctly
@@ -412,22 +536,27 @@ func setupDetachedCommitBeadsWorktree(t *testing.T) (string, string, string) {
 	if err := cmd.Run(); err != nil {
 		t.Skipf("git not available: %v", err)
 	}
+	// Ensure HEAD points to main regardless of init.defaultBranch setting.
+	// Without this, worktree add -b main fails on systems where the default
+	// branch is not "main". Fix inspired by PR #2565 (cwalv).
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "symbolic-ref", "HEAD", "refs/heads/main")
 
-	runGitInDir(t, tmpDir, "--git-dir", bareDir, "worktree", "add", "-b", "main", mainWorktreeDir)
-	runGitInDir(t, mainWorktreeDir, "config", "user.email", "test@example.com")
-	runGitInDir(t, mainWorktreeDir, "config", "user.name", "Test User")
+	// A bare repo starts with no commits, so HEAD is invalid. Create an
+	// initial empty commit so "git worktree add -b main" can succeed.
+	// We use plumbing commands since "git commit" requires a worktree.
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "config", "user.email", "test@example.com")
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "config", "user.name", "Test User")
+	emptyTree := runGitInDir(t, tmpDir, "--git-dir", bareDir, "hash-object", "-t", "tree", "/dev/null")
+	initCommit := runGitInDir(t, tmpDir, "--git-dir", bareDir, "commit-tree", "-m", "Initial commit", emptyTree)
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "update-ref", "HEAD", initCommit)
+
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "worktree", "add", mainWorktreeDir, "main")
 
 	mainBeadsDir := filepath.Join(mainWorktreeDir, ".beads")
 	mainDoltDir := filepath.Join(mainBeadsDir, "dolt")
 	if err := os.MkdirAll(mainDoltDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(mainWorktreeDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	runGitInDir(t, mainWorktreeDir, "add", "-A")
-	runGitInDir(t, mainWorktreeDir, "commit", "-m", "Initial commit")
 
 	head := runGitInDir(t, mainWorktreeDir, "rev-parse", "HEAD")
 	detachedWorktreeDir := filepath.Join(storeDir, "refs", "commits", head)
@@ -451,6 +580,28 @@ func runGitInDir(t *testing.T, dir string, args ...string) string {
 	}
 
 	return strings.TrimSpace(string(output))
+}
+
+func setupBareParentWorktree(t *testing.T) (string, string) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	bareDir := filepath.Join(tmpDir, "repo.git")
+	mainWorktreeDir := filepath.Join(tmpDir, "main")
+	featureWorktreeDir := filepath.Join(tmpDir, "feature")
+
+	runGitInDir(t, tmpDir, "init", "--bare", bareDir)
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "symbolic-ref", "HEAD", "refs/heads/main")
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "config", "user.email", "test@example.com")
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "config", "user.name", "Test User")
+	emptyTree := runGitInDir(t, tmpDir, "--git-dir", bareDir, "hash-object", "-t", "tree", "/dev/null")
+	initCommit := runGitInDir(t, tmpDir, "--git-dir", bareDir, "commit-tree", "-m", "Initial commit", emptyTree)
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "update-ref", "HEAD", initCommit)
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "worktree", "add", mainWorktreeDir, "main")
+	runGitInDir(t, mainWorktreeDir, "branch", "feature")
+	runGitInDir(t, tmpDir, "--git-dir", bareDir, "worktree", "add", featureWorktreeDir, "feature")
+
+	return bareDir, featureWorktreeDir
 }
 
 // TestFollowRedirect tests the redirect file functionality
@@ -1684,5 +1835,304 @@ func TestFindDatabasePath_WorktreeNoLocalDB(t *testing.T) {
 
 	if resultResolved != mainDoltResolved {
 		t.Errorf("FindDatabasePath() = %q, want main repo shared db %q", result, mainDoltDir)
+	}
+}
+
+// writeMetadataJSON writes a metadata.json file to the given .beads directory.
+func writeMetadataJSON(t *testing.T, beadsDir string, cfg *configfile.Config) {
+	t.Helper()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("failed to marshal metadata.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+		t.Fatalf("failed to write metadata.json: %v", err)
+	}
+}
+
+// TestResolveRedirect_PreservesSourceDatabase tests that ResolveRedirect captures
+// the source rig's dolt_database from metadata.json before following a redirect.
+// When a source directory has a redirect to a shared directory with a different
+// dolt_database, the source database name must be preserved.
+func TestResolveRedirect_PreservesSourceDatabase(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Resolve symlinks for macOS /private/var path consistency
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+
+	// Create source .beads with dolt_database: "lola"
+	sourceDir := filepath.Join(tmpDir, "lola", ".beads")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, sourceDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltMode:     "server",
+		DoltDatabase: "lola",
+	})
+
+	// Create target (shared) .beads with dolt_database: "hq"
+	targetDir := filepath.Join(tmpDir, "town", ".beads")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, targetDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltMode:     "server",
+		DoltDatabase: "hq",
+	})
+
+	// Write redirect from source to target
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info := ResolveRedirect(sourceDir)
+
+	// Verify redirect was followed
+	if !info.WasRedirected {
+		t.Error("expected WasRedirected=true")
+	}
+
+	// Verify source database is preserved
+	if info.SourceDatabase != "lola" {
+		t.Errorf("SourceDatabase = %q, want %q", info.SourceDatabase, "lola")
+	}
+
+	// Verify source and target dirs are correct
+	sourceResolved, _ := filepath.EvalSymlinks(sourceDir)
+	targetResolved, _ := filepath.EvalSymlinks(targetDir)
+	infoSourceResolved, _ := filepath.EvalSymlinks(info.SourceDir)
+	infoTargetResolved, _ := filepath.EvalSymlinks(info.TargetDir)
+
+	if infoSourceResolved != sourceResolved {
+		t.Errorf("SourceDir = %q, want %q", info.SourceDir, sourceDir)
+	}
+	if infoTargetResolved != targetResolved {
+		t.Errorf("TargetDir = %q, want %q", info.TargetDir, targetDir)
+	}
+}
+
+// TestResolveRedirect_NoRedirect tests that ResolveRedirect works correctly when
+// there is no redirect file (source and target are the same).
+func TestResolveRedirect_NoRedirect(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, beadsDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltDatabase: "mydb",
+	})
+
+	info := ResolveRedirect(beadsDir)
+
+	if info.WasRedirected {
+		t.Error("expected WasRedirected=false when no redirect file exists")
+	}
+	if info.SourceDatabase != "mydb" {
+		t.Errorf("SourceDatabase = %q, want %q", info.SourceDatabase, "mydb")
+	}
+
+	beadsDirResolved, _ := filepath.EvalSymlinks(beadsDir)
+	infoSourceResolved, _ := filepath.EvalSymlinks(info.SourceDir)
+	infoTargetResolved, _ := filepath.EvalSymlinks(info.TargetDir)
+
+	if infoSourceResolved != beadsDirResolved {
+		t.Errorf("SourceDir = %q, want %q", info.SourceDir, beadsDir)
+	}
+	if infoTargetResolved != beadsDirResolved {
+		t.Errorf("TargetDir = %q, want same as source %q when no redirect", info.TargetDir, beadsDir)
+	}
+}
+
+// TestResolveRedirect_NoSourceMetadata tests that ResolveRedirect handles a source
+// directory with no metadata.json (SourceDatabase should be empty).
+func TestResolveRedirect_NoSourceMetadata(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+
+	sourceDir := filepath.Join(tmpDir, "rig", ".beads")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// No metadata.json in source
+
+	targetDir := filepath.Join(tmpDir, "town", ".beads")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, targetDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltDatabase: "hq",
+	})
+
+	// Write redirect from source to target
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info := ResolveRedirect(sourceDir)
+
+	if !info.WasRedirected {
+		t.Error("expected WasRedirected=true")
+	}
+	if info.SourceDatabase != "" {
+		t.Errorf("SourceDatabase = %q, want empty string when no source metadata", info.SourceDatabase)
+	}
+}
+
+// TestResolveRedirect_SourceHasNoDoltDatabase tests that ResolveRedirect handles
+// a source whose metadata.json exists but has no dolt_database field.
+func TestResolveRedirect_SourceHasNoDoltDatabase(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+
+	sourceDir := filepath.Join(tmpDir, "rig", ".beads")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Source metadata has no dolt_database
+	writeMetadataJSON(t, sourceDir, &configfile.Config{
+		Database: "beads.db",
+	})
+
+	targetDir := filepath.Join(tmpDir, "town", ".beads")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, targetDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltDatabase: "hq",
+	})
+
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info := ResolveRedirect(sourceDir)
+
+	if !info.WasRedirected {
+		t.Error("expected WasRedirected=true")
+	}
+	// No dolt_database in source => SourceDatabase should be empty
+	// This means the target's dolt_database will be used (no override)
+	if info.SourceDatabase != "" {
+		t.Errorf("SourceDatabase = %q, want empty string when source has no dolt_database", info.SourceDatabase)
+	}
+}
+
+// TestResolveRedirect_SourceDatabaseAvailableForRouting tests that ResolveRedirect
+// captures the source database so callers (like routing code) can set the env var.
+// The env var is NOT set by FollowRedirect itself (that caused hangs from circular
+// configfile.Load calls). Instead, routing callers use ResolveRedirect and set
+// BEADS_DOLT_SERVER_DATABASE explicitly.
+func TestResolveRedirect_SourceDatabaseAvailableForRouting(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+
+	// Create source .beads with dolt_database: "lola"
+	sourceDir := filepath.Join(tmpDir, "lola", ".beads")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, sourceDir, &configfile.Config{
+		DoltDatabase: "lola",
+	})
+
+	// Create target (shared) .beads with dolt_database: "hq"
+	targetDir := filepath.Join(tmpDir, "town", ".beads")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, targetDir, &configfile.Config{
+		DoltDatabase: "hq",
+	})
+
+	// Write redirect
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info := ResolveRedirect(sourceDir)
+
+	// Source database should be available for routing callers to use
+	if info.SourceDatabase != "lola" {
+		t.Errorf("SourceDatabase = %q, want %q", info.SourceDatabase, "lola")
+	}
+	if !info.WasRedirected {
+		t.Error("expected WasRedirected=true")
+	}
+}
+
+func TestFindBeadsDir_BareParentWorktreeFallback(t *testing.T) {
+	originalEnvDir := os.Getenv("BEADS_DIR")
+	originalEnvDB := os.Getenv("BEADS_DB")
+	defer func() {
+		if originalEnvDir != "" {
+			os.Setenv("BEADS_DIR", originalEnvDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		if originalEnvDB != "" {
+			os.Setenv("BEADS_DB", originalEnvDB)
+		} else {
+			os.Unsetenv("BEADS_DB")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+	os.Unsetenv("BEADS_DB")
+
+	bareDir, worktreeDir := setupBareParentWorktree(t)
+	bareBeadsDir := filepath.Join(bareDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(bareBeadsDir, "dolt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(worktreeDir)
+	git.ResetCaches()
+
+	result := FindBeadsDir()
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	bareBeadsResolved, _ := filepath.EvalSymlinks(bareBeadsDir)
+	if resultResolved != bareBeadsResolved {
+		t.Errorf("FindBeadsDir() = %q, want bare parent .beads %q", result, bareBeadsDir)
+	}
+}
+
+func TestFindDatabasePath_BareParentWorktreeFallback(t *testing.T) {
+	originalEnvDir := os.Getenv("BEADS_DIR")
+	originalEnvDB := os.Getenv("BEADS_DB")
+	defer func() {
+		if originalEnvDir != "" {
+			os.Setenv("BEADS_DIR", originalEnvDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		if originalEnvDB != "" {
+			os.Setenv("BEADS_DB", originalEnvDB)
+		} else {
+			os.Unsetenv("BEADS_DB")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+	os.Unsetenv("BEADS_DB")
+
+	bareDir, worktreeDir := setupBareParentWorktree(t)
+	bareDoltDir := filepath.Join(bareDir, ".beads", "dolt")
+	if err := os.MkdirAll(bareDoltDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(worktreeDir)
+	git.ResetCaches()
+
+	result := FindDatabasePath()
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	bareDoltResolved, _ := filepath.EvalSymlinks(bareDoltDir)
+	if resultResolved != bareDoltResolved {
+		t.Errorf("FindDatabasePath() = %q, want bare parent db %q", result, bareDoltDir)
 	}
 }

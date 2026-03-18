@@ -1,0 +1,308 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+)
+
+// lastWrittenRefs tracks the last hash+branch written by writeBeadsRefs to
+// avoid redundant file writes and git-add subprocesses within a single
+// command invocation (auto-commit writes refs, then PersistentPostRun does too).
+var lastWrittenRefs string
+
+// writeBeadsRefs writes the current Dolt branch and commit hash to the beads
+// ref files, mirroring git's own .git/HEAD + .git/refs/heads/ structure:
+//
+//	.beads/HEAD                  ← "ref: refs/heads/<branch>"
+//	.beads/refs/heads/<branch>   ← "<dolt-commit-hash>"
+//
+// Called after every Dolt commit (auto-commit and explicit).
+func writeBeadsRefs(ctx context.Context, si storage.DoltStorage) {
+	s, ok := si.(*dolt.DoltStore)
+	if !ok || s == nil || s.IsClosed() {
+		return
+	}
+	if !config.IsBranchStrategyEnabled() {
+		return
+	}
+
+	beadsDir := filepath.Dir(s.Path())
+
+	hash, err := s.GetCurrentCommit(ctx)
+	if err != nil {
+		debug.Logf("writeBeadsRefs: GetCurrentCommit: %v", err)
+		return // best effort
+	}
+
+	branch, err := s.CurrentBranch(ctx)
+	if err != nil {
+		branch = "main" // fallback
+	}
+
+	// Skip if we already wrote these exact refs this invocation.
+	key := branch + ":" + hash
+	if key == lastWrittenRefs {
+		return
+	}
+
+	// Write .beads/HEAD
+	headPath := filepath.Join(beadsDir, "HEAD")
+	headContent := fmt.Sprintf("ref: refs/heads/%s\n", branch)
+	if err := os.WriteFile(headPath, []byte(headContent), 0644); err != nil {
+		debug.Logf("writeBeadsRefs: write HEAD: %v", err)
+		return // best effort
+	}
+
+	// Write .beads/refs/heads/<branch>
+	refsDir := filepath.Join(beadsDir, "refs", "heads")
+	if err := os.MkdirAll(refsDir, 0755); err != nil {
+		debug.Logf("writeBeadsRefs: MkdirAll refs: %v", err)
+		return // best effort
+	}
+	refPath := filepath.Join(refsDir, branch)
+	if err := os.WriteFile(refPath, []byte(hash+"\n"), 0644); err != nil {
+		debug.Logf("writeBeadsRefs: write ref %s: %v", branch, err)
+		return // best effort
+	}
+
+	// git add ref files (best effort — may not be in a git repo)
+	projectRoot := filepath.Dir(beadsDir)
+	cmd := exec.CommandContext(ctx, "git", "add", headPath, refPath)
+	cmd.Dir = projectRoot
+	_ = cmd.Run()
+
+	lastWrittenRefs = key
+}
+
+// readBeadsRefs reads .beads/HEAD and the corresponding ref file to determine
+// the saved Dolt branch and commit hash. Returns empty strings if files don't
+// exist or can't be parsed.
+func readBeadsRefs(beadsDir string) (commitHash, branch string) {
+	// Read .beads/HEAD → "ref: refs/heads/<branch>"
+	headPath := filepath.Join(beadsDir, "HEAD")
+	headData, err := os.ReadFile(headPath)
+	if err != nil {
+		return "", ""
+	}
+
+	headLine := strings.TrimSpace(string(headData))
+	if !strings.HasPrefix(headLine, "ref: refs/heads/") {
+		return "", ""
+	}
+	branch = strings.TrimPrefix(headLine, "ref: refs/heads/")
+
+	// Read .beads/refs/heads/<branch> → "<hash>"
+	refPath := filepath.Join(beadsDir, "refs", "heads", branch)
+	refData, err := os.ReadFile(refPath)
+	if err != nil {
+		return "", branch
+	}
+
+	commitHash = strings.TrimSpace(string(refData))
+	return commitHash, branch
+}
+
+// checkBeadsRefSync compares .beads/refs against the current Dolt state and
+// takes action based on branch_strategy.* settings. Called from PersistentPreRun
+// after store initialization.
+//
+// Settings (all default to false):
+//   - branch_strategy.prompt: show interactive prompt at decision points
+//   - branch_strategy.defaults.reset_dolt_with_git: auto-reset Dolt on mismatch
+//
+// Behavior matrix:
+//
+//	prompt=false, reset=false → silent (log to debug, no action)
+//	prompt=false, reset=true  → auto-reset, message to stderr
+//	prompt=true,  reset=false → prompt [y/N], default keeps current state
+//	prompt=true,  reset=true  → prompt [Y/n], default resets
+func checkBeadsRefSync(ctx context.Context, si storage.DoltStorage) {
+	checkBeadsRefSyncWithGitLine(ctx, si, "")
+}
+
+// checkBeadsRefSyncWithGitLine compares .beads/refs against the current Dolt state and
+// takes action based on branch_strategy.* settings. When gitResetLine is non-empty
+// (from bd reset), it's included in the prompt for context.
+func checkBeadsRefSyncWithGitLine(ctx context.Context, si storage.DoltStorage, gitResetLine string) {
+	s, ok := si.(*dolt.DoltStore)
+	if !ok || s == nil || s.IsClosed() {
+		return
+	}
+
+	beadsDir := filepath.Dir(s.Path())
+
+	if !config.IsBranchStrategyEnabled() {
+		// Refs disabled — clean up stale ref files if they exist
+		cleanupStaleBeadsRefs(beadsDir)
+		return
+	}
+
+	savedHash, _ := readBeadsRefs(beadsDir)
+	if savedHash == "" {
+		// No ref files — pre-feature commit or first use.
+		return
+	}
+
+	// Get current Dolt state
+	currentHash, err := s.GetCurrentCommit(ctx)
+	if err != nil {
+		return // can't check — skip silently
+	}
+	currentBranch, err := s.CurrentBranch(ctx)
+	if err != nil {
+		return
+	}
+
+	// Phase 1: everything stays on main — no Dolt branch switching.
+	// Branch checkout logic belongs in Phase 2 (strategy A/B).
+
+	// Compare commit hashes
+	if currentHash == savedHash {
+		return // In sync
+	}
+
+	// Mismatch detected — read settings from config.yaml
+	// (git-tracked, survives DOLT_RESET --hard unlike the Dolt config table)
+	promptEnabled := config.GetBool("branch_strategy.prompt")
+	resetDefault := config.GetBool("branch_strategy.defaults.reset_dolt_with_git")
+
+	debug.Logf("beads ref sync: mismatch on %s (have %s, want %s) prompt=%v reset=%v",
+		currentBranch, truncHash(currentHash), truncHash(savedHash), promptEnabled, resetDefault)
+
+	if !promptEnabled && !resetDefault {
+		// Silent mode (default) — detect but take no action
+		return
+	}
+
+	if !promptEnabled && resetDefault {
+		// Auto-reset without prompting
+		if err := s.ResetToCommit(ctx, savedHash); err != nil {
+			fmt.Fprintf(os.Stderr, "beads: auto-sync reset failed: %v\n", err)
+		} else {
+			msg := getDoltCommitMessage(ctx, s, savedHash)
+			fmt.Fprintf(os.Stderr, "dolt: HEAD is now at %s", truncHash(savedHash))
+			if msg != "" {
+				fmt.Fprintf(os.Stderr, " %s", msg)
+			}
+			fmt.Fprintf(os.Stderr, "\n")
+		}
+		return
+	}
+
+	// Prompt mode — need a TTY
+	if !isTerminal() {
+		fmt.Fprintf(os.Stderr, "beads: warning: Dolt state mismatch (have %s, want %s). "+
+			"Set branch_strategy.defaults.reset_dolt_with_git=true to auto-reset.\n",
+			truncHash(currentHash), truncHash(savedHash))
+		return
+	}
+
+	// Build prompt
+	defaultIsReset := resetDefault // true when both prompt and reset are true
+	currentMsg := getDoltCommitMessage(ctx, s, currentHash)
+	savedMsg := getDoltCommitMessage(ctx, s, savedHash)
+
+	fmt.Fprintf(os.Stderr, "dolt: HEAD currently at %s", truncHash(currentHash))
+	if currentMsg != "" {
+		fmt.Fprintf(os.Stderr, " %s", currentMsg)
+	}
+	fmt.Fprintf(os.Stderr, "\n")
+
+	fmt.Fprintf(os.Stderr, "Reset dolt HEAD to %s", truncHash(savedHash))
+	if savedMsg != "" {
+		fmt.Fprintf(os.Stderr, " %s", savedMsg)
+	}
+	if defaultIsReset {
+		fmt.Fprintf(os.Stderr, "? [Y/n]: ")
+	} else {
+		fmt.Fprintf(os.Stderr, "? [y/N]: ")
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return // EOF or error — keep current
+	}
+	choice := strings.TrimSpace(strings.ToLower(line))
+
+	shouldReset := false
+	if choice == "" {
+		shouldReset = defaultIsReset // Enter = default
+	} else if choice == "y" || choice == "yes" {
+		shouldReset = true
+	}
+
+	if shouldReset {
+		if err := s.ResetToCommit(ctx, savedHash); err != nil {
+			fmt.Fprintf(os.Stderr, "beads: reset failed: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "dolt: HEAD is now at %s", truncHash(savedHash))
+			if savedMsg != "" {
+				fmt.Fprintf(os.Stderr, " %s", savedMsg)
+			}
+			fmt.Fprintf(os.Stderr, "\n")
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "beads: keeping current Dolt state\n")
+	}
+}
+
+// cleanupStaleBeadsRefs stages deletion of ref files when branch_strategy is
+// disabled but ref files still exist from a previous configuration. Warns the
+// user and suggests a commit message.
+func cleanupStaleBeadsRefs(beadsDir string) {
+	headPath := filepath.Join(beadsDir, "HEAD")
+	if _, err := os.Stat(headPath); os.IsNotExist(err) {
+		return // no ref files — nothing to clean up
+	}
+
+	projectRoot := filepath.Dir(beadsDir)
+	refsDir := filepath.Join(beadsDir, "refs")
+
+	// Stage deletion of ref files
+	cmd := exec.CommandContext(context.Background(), "git", "rm", "--cached", "-r", "--ignore-unmatch", headPath, refsDir)
+	cmd.Dir = projectRoot
+	_ = cmd.Run()
+
+	// Remove from disk
+	os.Remove(headPath)
+	os.RemoveAll(refsDir)
+
+	fmt.Fprintf(os.Stderr, "beads: branch_strategy disabled — removed stale ref files (.beads/HEAD, .beads/refs/)\n")
+	fmt.Fprintf(os.Stderr, "beads: suggested commit: git commit -m \"chore: remove beads ref files (branch_strategy disabled)\"\n")
+}
+
+// truncHash returns the first 8 characters of a hash, or the full string if shorter.
+func truncHash(h string) string {
+	if len(h) > 8 {
+		return h[:8]
+	}
+	return h
+}
+
+// getDoltCommitMessage returns the commit message for a given Dolt commit hash.
+// Returns empty string on any error (best effort).
+func getDoltCommitMessage(ctx context.Context, s *dolt.DoltStore, hash string) string {
+	if s == nil || s.IsClosed() {
+		return ""
+	}
+	// Use dolt_commits (not dolt_log) to find commits that may be ahead of
+	// the current HEAD — e.g., when resetting forward after a backward reset.
+	row := s.DB().QueryRowContext(ctx,
+		"SELECT message FROM dolt_commits WHERE commit_hash = ? LIMIT 1", hash)
+	var msg string
+	if err := row.Scan(&msg); err != nil {
+		return ""
+	}
+	return msg
+}

@@ -86,6 +86,22 @@ var createCmd = &cobra.Command{
 		// Get field values
 		description, _ := getDescriptionFlag(cmd)
 
+		skills, _ := cmd.Flags().GetString("skills")
+		if skills != "" {
+			if description != "" {
+				description += "\n\n"
+			}
+			description += "## Required Skills\n" + skills
+		}
+
+		ctxStr, _ := cmd.Flags().GetString("context")
+		if ctxStr != "" {
+			if description != "" {
+				description += "\n\n"
+			}
+			description += "## Context\n" + ctxStr
+		}
+
 		// Check if description is required by config
 		if description == "" && !isTestIssue(title) {
 			if config.GetBool("create.require-description") {
@@ -131,6 +147,10 @@ var createCmd = &cobra.Command{
 		rigOverride, _ := cmd.Flags().GetString("rig")
 		prefixOverride, _ := cmd.Flags().GetString("prefix")
 		wisp, _ := cmd.Flags().GetBool("ephemeral")
+		noHistory, _ := cmd.Flags().GetBool("no-history")
+		if wisp && noHistory {
+			FatalError("--ephemeral and --no-history are mutually exclusive")
+		}
 		molTypeStr, _ := cmd.Flags().GetString("mol-type")
 		var molType types.MolType
 		if molTypeStr != "" {
@@ -241,6 +261,7 @@ var createCmd = &cobra.Command{
 				Assignee:           assignee,
 				ExternalRef:        externalRefPtr,
 				Ephemeral:          wisp,
+				NoHistory:          noHistory,
 				CreatedBy:          getActorWithGit(),
 				Owner:              getOwner(),
 				MolType:            molType,
@@ -315,7 +336,7 @@ var createCmd = &cobra.Command{
 								// Found a matching route - auto-route to that rig
 								rigName := routing.ExtractProjectFromPath(route.Path)
 								if rigName != "" {
-									createInRig(cmd, rigName, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, specID, wisp)
+									createInRig(cmd, rigName, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, specID, wisp, noHistory)
 									return
 								}
 							}
@@ -335,7 +356,7 @@ var createCmd = &cobra.Command{
 			targetRig = prefixOverride
 		}
 		if targetRig != "" {
-			createInRig(cmd, targetRig, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, specID, wisp)
+			createInRig(cmd, targetRig, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, specID, wisp, noHistory)
 			return
 		}
 
@@ -413,7 +434,7 @@ var createCmd = &cobra.Command{
 
 		// Switch to target repo for multi-repo support (bd-6x6g)
 		// When routing to a different repo, we use direct storage access
-		var targetStore *dolt.DoltStore
+		var targetStore storage.DoltStorage
 		if repoPath != "." {
 			targetBeadsDir := routing.ExpandPath(repoPath)
 			debug.Logf("DEBUG: Routing to target repo: %s\n", targetBeadsDir)
@@ -426,7 +447,7 @@ var createCmd = &cobra.Command{
 			// Open new store for target repo using factory to respect backend config
 			targetBeadsDirPath := filepath.Join(targetBeadsDir, ".beads")
 			var err error
-			targetStore, err = dolt.NewFromConfig(rootCtx, targetBeadsDirPath)
+			targetStore, err = newDoltStoreFromConfig(rootCtx, targetBeadsDirPath)
 			if err != nil {
 				FatalError("failed to open target store: %v", err)
 			}
@@ -526,6 +547,7 @@ var createCmd = &cobra.Command{
 			ExternalRef:        externalRefPtr,
 			EstimatedMinutes:   estimatedMinutes,
 			Ephemeral:          wisp,
+			NoHistory:          noHistory,
 			CreatedBy:          getActorWithGit(),
 			Owner:              getOwner(),
 			MolType:            molType,
@@ -739,15 +761,15 @@ var createCmd = &cobra.Command{
 			}
 		}
 
-		// Commit post-create metadata (deps, labels) to Dolt. CreateIssue's
-		// internal DOLT_COMMIT only covers the issue row; AddDependency and
-		// AddLabel write to the SQL working set without a Dolt commit. Without
-		// this, the metadata is visible but not durable — it can be lost on
-		// push, sync, or server restart (GH#2009).
-		if postCreateWrites {
-			commitMsg := fmt.Sprintf("bd: create %s (metadata)", issue.ID)
+		// Commit to Dolt. In DoltStore mode, CreateIssue commits the issue
+		// row internally, so only post-create metadata (deps, labels) needs
+		// a separate commit. In EmbeddedDoltStore mode, CreateIssue writes
+		// to the working set without a Dolt commit, so we always commit
+		// everything together at the end.
+		if isEmbeddedDolt || postCreateWrites {
+			commitMsg := fmt.Sprintf("bd: create %s", issue.ID)
 			if err := store.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
-				WarnError("failed to commit post-create metadata: %v", err)
+				WarnError("failed to commit: %v", err)
 			}
 		}
 
@@ -794,6 +816,8 @@ func init() {
 	registerCommonIssueFlags(createCmd)
 	createCmd.Flags().String("spec-id", "", "Link to specification document")
 	createCmd.Flags().StringSliceP("labels", "l", []string{}, "Labels (comma-separated)")
+	createCmd.Flags().String("skills", "", "Required skills for this issue")
+	createCmd.Flags().String("context", "", "Additional context for the issue")
 	createCmd.Flags().StringSlice("label", []string{}, "Alias for --labels")
 	_ = createCmd.Flags().MarkHidden("label") // Only fails if flag missing (caught in tests)
 	createCmd.Flags().String("id", "", "Explicit issue ID (e.g., 'bd-42' for partitioning)")
@@ -808,6 +832,7 @@ func init() {
 	createCmd.Flags().String("prefix", "", "Create issue in rig by prefix (e.g., --prefix bd- or --prefix bd or --prefix beads)")
 	createCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
 	createCmd.Flags().Bool("ephemeral", false, "Create as ephemeral (short-lived, subject to TTL compaction)")
+	createCmd.Flags().Bool("no-history", false, "Skip Dolt commit history without making GC-eligible (for permanent agent beads)")
 	createCmd.Flags().String("mol-type", "", "Molecule type: swarm (multi-polecat), patrol (recurring ops), work (default)")
 	createCmd.Flags().String("wisp-type", "", "Wisp type for TTL-based compaction: heartbeat, ping, patrol, gc_report, recovery, error, escalation")
 	createCmd.Flags().Bool("validate", false, "Validate description contains required sections for issue type")
@@ -835,7 +860,7 @@ func init() {
 
 // createInRig creates an issue in a different rig using --rig flag or auto-routing.
 // This directly creates in the target rig's database.
-func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, issueType string, priority int, design, acceptance, notes, assignee string, labels []string, externalRef, specID string, wisp bool) {
+func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, issueType string, priority int, design, acceptance, notes, assignee string, labels []string, externalRef, specID string, wisp, noHistory bool) {
 	ctx := rootCtx
 
 	// Find the town-level beads directory (where routes.jsonl lives)
@@ -851,7 +876,7 @@ func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, is
 	}
 
 	// Open storage for the target rig using factory to respect backend config
-	targetStore, err := dolt.NewFromConfig(ctx, targetBeadsDir)
+	targetStore, err := newDoltStoreFromConfig(ctx, targetBeadsDir)
 	if err != nil {
 		FatalError("failed to open rig %q database: %v", rigName, err)
 	}
@@ -952,6 +977,7 @@ func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, is
 		Assignee:           assignee,
 		ExternalRef:        externalRefPtr,
 		Ephemeral:          wisp,
+		NoHistory:          noHistory,
 		CreatedBy:          getActorWithGit(),
 		Owner:              getOwner(),
 		// Event fields (bd-xwvo fix)
@@ -1038,7 +1064,7 @@ func formatTimeForRPC(t *time.Time) string {
 // ensureBeadsDirForPath ensures a beads directory exists at the target path.
 // If the .beads directory doesn't exist, it creates it and initializes with
 // the same prefix as the source store (T010, T012: prefix inheritance).
-func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore *dolt.DoltStore) error {
+func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore storage.DoltStorage) error {
 	beadsDir := filepath.Join(targetPath, ".beads")
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 
@@ -1058,8 +1084,14 @@ func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore *
 	if sourceStore != nil {
 		sourcePrefix, err := sourceStore.GetConfig(ctx, "issue_prefix")
 		if err == nil && sourcePrefix != "" {
-			// Open target store temporarily to set prefix
-			tempStore, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{CreateIfMissing: true})
+			// Open target store temporarily to set prefix.
+			// Use newDoltStore with explicit config since the target .beads
+			// directory was just created and has no metadata.json yet.
+			tempStore, err := newDoltStore(ctx, &dolt.Config{
+				BeadsDir:        beadsDir,
+				Database:        sourcePrefix,
+				CreateIfMissing: true,
+			})
 			if err != nil {
 				return fmt.Errorf("failed to initialize target database: %w", err)
 			}

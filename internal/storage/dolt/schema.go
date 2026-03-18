@@ -3,7 +3,7 @@ package dolt
 // currentSchemaVersion is bumped whenever the schema or migrations change.
 // initSchemaOnDB checks this against the stored version and skips re-initialization
 // when they match, avoiding ~20 DDL statements per bd invocation.
-const currentSchemaVersion = 6
+const currentSchemaVersion = 8
 
 // schema defines the MySQL-compatible database schema for Dolt.
 const schema = `
@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS issues (
     -- Messaging fields
     sender VARCHAR(255) DEFAULT '',
     ephemeral TINYINT(1) DEFAULT 0,
+    -- NoHistory: stored in wisps table but NOT GC-eligible (gh-2619)
+    no_history TINYINT(1) DEFAULT 0,
     -- Wisp classification for TTL-based compaction (gt-9br)
     wisp_type VARCHAR(32) DEFAULT '',
     -- Pinned field
@@ -116,7 +118,7 @@ CREATE TABLE IF NOT EXISTS labels (
 
 -- Comments table
 CREATE TABLE IF NOT EXISTS comments (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id CHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
     issue_id VARCHAR(255) NOT NULL,
     author VARCHAR(255) NOT NULL,
     text TEXT NOT NULL,
@@ -128,7 +130,7 @@ CREATE TABLE IF NOT EXISTS comments (
 
 -- Events table (audit trail)
 CREATE TABLE IF NOT EXISTS events (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id CHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
     issue_id VARCHAR(255) NOT NULL,
     event_type VARCHAR(32) NOT NULL,
     actor VARCHAR(255) NOT NULL,
@@ -161,7 +163,7 @@ CREATE TABLE IF NOT EXISTS child_counters (
 
 -- Issue snapshots table (for compaction)
 CREATE TABLE IF NOT EXISTS issue_snapshots (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id CHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
     issue_id VARCHAR(255) NOT NULL,
     snapshot_time DATETIME NOT NULL,
     compaction_level INT NOT NULL,
@@ -176,7 +178,7 @@ CREATE TABLE IF NOT EXISTS issue_snapshots (
 
 -- Compaction snapshots table
 CREATE TABLE IF NOT EXISTS compaction_snapshots (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id CHAR(36) NOT NULL PRIMARY KEY DEFAULT (UUID()),
     issue_id VARCHAR(255) NOT NULL,
     compaction_level INT NOT NULL,
     snapshot_json BLOB NOT NULL,

@@ -55,6 +55,7 @@ environment variable.`,
 		team, _ := cmd.Flags().GetBool("team")
 		stealth, _ := cmd.Flags().GetBool("stealth")
 		skipHooks, _ := cmd.Flags().GetBool("skip-hooks")
+		skipAgents, _ := cmd.Flags().GetBool("skip-agents")
 		force, _ := cmd.Flags().GetBool("force")
 		fromJSONL, _ := cmd.Flags().GetBool("from-jsonl")
 		// Dolt server connection flags
@@ -189,8 +190,10 @@ environment variable.`,
 			prefix = filepath.Base(cwd)
 		}
 
-		// Normalize prefix: strip trailing hyphens
-		// The hyphen is added automatically during ID generation
+		// Normalize prefix: strip leading dots and trailing hyphens.
+		// Leading dots produce invalid Dolt database names (e.g. ".claude" -> "bd_.claude").
+		// The trailing hyphen is added automatically during ID generation.
+		prefix = strings.TrimLeft(prefix, ".")
 		prefix = strings.TrimRight(prefix, "-")
 
 		// Sanitize prefix for use as a MySQL database name.
@@ -209,8 +212,11 @@ environment variable.`,
 		if envBeadsDir := os.Getenv("BEADS_DIR"); envBeadsDir != "" {
 			beadsDirForInit = utils.CanonicalizePath(envBeadsDir)
 		} else {
-			localBeadsDir := filepath.Join(".", ".beads")
-			beadsDirForInit = beads.FollowRedirect(localBeadsDir)
+			beadsDirForInit = beads.GetWorktreeFallbackBeadsDir()
+			if beadsDirForInit == "" {
+				localBeadsDir := filepath.Join(".", ".beads")
+				beadsDirForInit = beads.FollowRedirect(localBeadsDir)
+			}
 		}
 
 		// Determine storage path.
@@ -230,34 +236,7 @@ environment variable.`,
 			FatalError("failed to get current directory: %v", err)
 		}
 
-		// Check if we're in a git worktree
-		// Guard with isGitRepo() check first - on Windows, git commands may hang
-		// when run outside a git repository (GH#727)
 		hasExplicitBeadsDir := os.Getenv("BEADS_DIR") != ""
-		isWorktree := false
-		if isGitRepo() {
-			isWorktree = git.IsWorktree()
-		}
-
-		// Prevent initialization from within a worktree (unless BEADS_DIR is
-		// explicitly set, which means the caller already knows where to init)
-		if isWorktree && !hasExplicitBeadsDir {
-			mainRepoRoot, err := git.GetMainRepoRoot()
-			if err != nil {
-				FatalError("failed to get main repository root: %v", err)
-			}
-
-			fmt.Fprintf(os.Stderr, "Error: cannot run 'bd init' from within a git worktree\n\n")
-			fmt.Fprintf(os.Stderr, "Git worktrees share the .beads database from the main repository.\n")
-			fmt.Fprintf(os.Stderr, "To fix this:\n\n")
-			fmt.Fprintf(os.Stderr, "  1. Initialize beads in the main repository:\n")
-			fmt.Fprintf(os.Stderr, "     cd %s\n", mainRepoRoot)
-			fmt.Fprintf(os.Stderr, "     bd init\n\n")
-			fmt.Fprintf(os.Stderr, "  2. Then create worktrees with beads support:\n")
-			fmt.Fprintf(os.Stderr, "     bd worktree create <path> --branch <branch-name>\n\n")
-			fmt.Fprintf(os.Stderr, "For more information, see: https://github.com/steveyegge/beads/blob/main/docs/WORKTREES.md\n")
-			os.Exit(1)
-		}
 
 		// Use the beadsDir computed earlier (before any directory creation)
 		// to ensure consistent path representation.
@@ -369,11 +348,13 @@ environment variable.`,
 		if existingCfg, _ := configfile.Load(beadsDir); existingCfg != nil && existingCfg.DoltDatabase != "" {
 			dbName = existingCfg.DoltDatabase
 		} else if prefix != "" {
-			// Sanitize hyphens to underscores for SQL-idiomatic database names.
+			// Sanitize hyphens and dots to underscores for SQL-idiomatic database names.
+			// Dots are invalid in Dolt/MySQL identifiers (e.g. from ".claude" directories).
 			// Must match the sanitization applied to metadata.json DoltDatabase
 			// field (line below), otherwise init creates a database with one name
 			// but metadata.json records a different name, causing reopens to fail.
 			dbName = strings.ReplaceAll(prefix, "-", "_")
+			dbName = strings.ReplaceAll(dbName, ".", "_")
 		} else {
 			dbName = "beads"
 		}
@@ -399,6 +380,16 @@ environment variable.`,
 				bootstrappedFromRemote = true
 				if !quiet {
 					fmt.Printf("  %s Bootstrapped from git remote: %s\n", ui.RenderPass("✓"), gitRemoteURL)
+				}
+			}
+		} else if !force && isGitRepo() && !isBareGitRepo() {
+			// Warn if origin has an existing beads database.
+			// Don't auto-clone here — bd bootstrap handles that.
+			if originURL, err := gitRemoteGetURL("origin"); err == nil && originURL != "" {
+				if gitLsRemoteHasRef("origin", "refs/dolt/data") {
+					fmt.Fprintf(os.Stderr, "Note: origin has an existing beads database (refs/dolt/data).\n")
+					fmt.Fprintf(os.Stderr, "  Run 'bd bootstrap' instead to clone it.\n")
+					fmt.Fprintf(os.Stderr, "  Continuing with fresh database initialization.\n\n")
 				}
 			}
 		}
@@ -448,6 +439,11 @@ environment variable.`,
 			os.Exit(1)
 		}
 		defer initLock.Unlock()
+
+		// Clean stale noms LOCK files from previously crashed processes
+		// before opening the embedded store. Without this, a crashed init
+		// leaves LOCK files that cause nil pointer dereference in DoltDB.
+		dolt.CleanStaleNomsLocks(doltserver.ResolveDoltDir(beadsDir))
 
 		store, err := newDoltStore(ctx, doltCfg)
 		if err != nil {
@@ -802,8 +798,8 @@ environment variable.`,
 		}
 
 		// Add agent instructions to AGENTS.md
-		// Skip in stealth mode (user wants invisible setup) and quiet mode (suppress all output)
-		if !stealth {
+		// Skip in stealth mode (user wants invisible setup) or when explicitly skipped
+		if !stealth && !skipAgents {
 			agentsTemplate, _ := cmd.Flags().GetString("agents-template")
 			if isBareGitRepo() {
 				if !quiet {
@@ -883,6 +879,12 @@ environment variable.`,
 			}
 			fmt.Printf("  Mode: %s\n", ui.RenderAccent("server"))
 			fmt.Printf("  Server: %s\n", ui.RenderAccent(fmt.Sprintf("%s@%s:%d", user, host, port)))
+			// Warn when using the default localhost — this is the #1 misconfiguration
+			// for setups where Dolt runs on a remote machine (e.g., over Tailscale).
+			if serverHost == "" && os.Getenv("BEADS_DOLT_SERVER_HOST") == "" {
+				fmt.Fprintf(os.Stderr, "\n  %s Server host defaulted to %s.\n", ui.RenderWarn("⚠"), configfile.DefaultDoltServerHost)
+				fmt.Fprintf(os.Stderr, "    If your Dolt server is remote, set BEADS_DOLT_SERVER_HOST or pass --server-host.\n")
+			}
 		}
 		fmt.Printf("  Database: %s\n", ui.RenderAccent(dbName))
 		fmt.Printf("  Issue prefix: %s\n", ui.RenderAccent(prefix))
@@ -933,6 +935,7 @@ func init() {
 	initCmd.Flags().Bool("stealth", false, "Enable stealth mode: global gitattributes and gitignore, no local repo tracking")
 	initCmd.Flags().Bool("setup-exclude", false, "Configure .git/info/exclude to keep beads files local (for forks)")
 	initCmd.Flags().Bool("skip-hooks", false, "Skip git hooks installation")
+	initCmd.Flags().Bool("skip-agents", false, "Skip AGENTS.md and Claude settings generation")
 	initCmd.Flags().Bool("force", false, "Force re-initialization even if database already has issues (may cause data loss)")
 	initCmd.Flags().Bool("from-jsonl", false, "Import issues from .beads/issues.jsonl instead of git history")
 	initCmd.Flags().String("destroy-token", "", "Explicit confirmation token for destructive re-init in non-interactive mode (format: 'DESTROY-<prefix>')")
@@ -1191,12 +1194,10 @@ func checkExistingBeadsData(prefix string) error {
 	// when run outside a git repository (GH#727)
 	var beadsDir string
 	if isGitRepo() && git.IsWorktree() {
-		// For worktrees, .beads should be in the main repository root
-		mainRepoRoot, err := git.GetMainRepoRoot()
-		if err != nil {
-			return nil // Can't determine main repo root, allow init to proceed
+		beadsDir = beads.GetWorktreeFallbackBeadsDir()
+		if beadsDir == "" {
+			return nil // Can't determine shared fallback, allow init to proceed
 		}
-		beadsDir = filepath.Join(mainRepoRoot, ".beads")
 	} else {
 		// For regular repos (or non-git directories), check current directory
 		beadsDir = filepath.Join(cwd, ".beads")

@@ -73,9 +73,10 @@ type Issue struct {
 	Comments     []*Comment    `json:"comments,omitempty"`
 
 	// ===== Messaging Fields (inter-agent communication) =====
-	Sender    string   `json:"sender,omitempty"`    // Who sent this (for messages)
-	Ephemeral bool     `json:"ephemeral,omitempty"` // If true, not synced via git
-	WispType  WispType `json:"wisp_type,omitempty"` // Classification for TTL-based compaction (gt-9br)
+	Sender    string   `json:"sender,omitempty"`     // Who sent this (for messages)
+	Ephemeral bool     `json:"ephemeral,omitempty"`  // If true, not synced via git
+	NoHistory bool     `json:"no_history,omitempty"` // If true, stored in wisps table but NOT GC-eligible
+	WispType  WispType `json:"wisp_type,omitempty"`  // Classification for TTL-based compaction (gt-9br)
 	// NOTE: RepliesTo, RelatesTo, DuplicateOf, SupersededBy moved to dependencies table
 	// per Decision 004 (Edge Schema Consolidation). Use dependency API instead.
 
@@ -308,6 +309,10 @@ func (i *Issue) ValidateWithCustom(customStatuses, customTypes []string) error {
 		if !json.Valid(i.Metadata) {
 			return fmt.Errorf("metadata must be valid JSON")
 		}
+	}
+	// Ephemeral and NoHistory are mutually exclusive (GH#2619)
+	if i.Ephemeral && i.NoHistory {
+		return fmt.Errorf("ephemeral and no_history are mutually exclusive")
 	}
 	return nil
 }
@@ -828,7 +833,7 @@ type Label struct {
 
 // Comment represents a comment on an issue
 type Comment struct {
-	ID        int64     `json:"id"`
+	ID        string    `json:"id"`
 	IssueID   string    `json:"issue_id"`
 	Author    string    `json:"author"`
 	Text      string    `json:"text"`
@@ -837,7 +842,7 @@ type Comment struct {
 
 // Event represents an audit trail entry
 type Event struct {
-	ID        int64     `json:"id"`
+	ID        string    `json:"id"`
 	IssueID   string    `json:"issue_id"`
 	EventType EventType `json:"event_type"`
 	Actor     string    `json:"actor"`

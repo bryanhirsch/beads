@@ -24,6 +24,7 @@ import (
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/molecules"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/telemetry"
 	"github.com/steveyegge/beads/internal/utils"
@@ -34,7 +35,7 @@ import (
 var (
 	dbPath     string
 	actor      string
-	store      *dolt.DoltStore
+	store      storage.DoltStorage
 	jsonOutput bool
 
 	// Signal-aware context for graceful cancellation
@@ -116,6 +117,35 @@ func isReadOnlyCommand(cmdName string) bool {
 	return readOnlyCommands[cmdName]
 }
 
+// resolveCommandBeadsDir maps a discovered Dolt data path back to the owning
+// .beads directory. filepath.Dir(dbPath) only works when the Dolt data lives
+// under .beads/dolt; custom dolt_data_dir values can place it elsewhere.
+func resolveCommandBeadsDir(dbPath string) string {
+	if dbPath == "" {
+		return ""
+	}
+
+	guessedBeadsDir := filepath.Dir(dbPath)
+
+	// BEADS_DB is an explicit database override, so preserve its legacy
+	// filepath.Dir behavior instead of trying to rediscover a repo-local .beads.
+	if os.Getenv("BEADS_DB") != "" {
+		return guessedBeadsDir
+	}
+
+	if cfg, err := configfile.Load(guessedBeadsDir); err == nil && cfg != nil {
+		if utils.PathsEqual(cfg.DatabasePath(guessedBeadsDir), dbPath) {
+			return guessedBeadsDir
+		}
+	}
+
+	if discoveredBeadsDir := beads.FindBeadsDir(); discoveredBeadsDir != "" {
+		return discoveredBeadsDir
+	}
+
+	return guessedBeadsDir
+}
+
 // getActorWithGit returns the actor for audit trails with git config fallback.
 // Priority: --actor flag > BD_ACTOR env > BEADS_ACTOR env > git config user.name > $USER > "unknown"
 // This provides a sensible default for developers: their git identity is used unless
@@ -182,6 +212,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
 	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BD_ACTOR, git user.name, $USER)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+	rootCmd.PersistentFlags().String("format", "", "Output format (json). Alias for --json")
+	_ = rootCmd.PersistentFlags().MarkHidden("format") // Hidden alias for CLI ergonomics
 	rootCmd.PersistentFlags().BoolVar(&sandboxMode, "sandbox", false, "Sandbox mode: disables auto-sync")
 	rootCmd.PersistentFlags().BoolVar(&readonlyMode, "readonly", false, "Read-only mode: block write operations (for worker sandboxes)")
 	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd dolt commit; uncommitted changes persist in the working set until then. SIGTERM/SIGHUP flush pending batch commits. Default: off. Override via config key dolt.auto-commit")
@@ -272,8 +304,15 @@ var rootCmd = &cobra.Command{
 			WasSet bool
 		})
 
+		// Handle --format json alias (desire-path from GH#2612)
+		if cmd.Root().PersistentFlags().Changed("format") {
+			format, _ := cmd.Root().PersistentFlags().GetString("format")
+			if strings.EqualFold(format, "json") {
+				jsonOutput = true
+			}
+		}
 		// If flag wasn't explicitly set, use viper value
-		if !cmd.Root().PersistentFlags().Changed("json") {
+		if !cmd.Root().PersistentFlags().Changed("json") && !cmd.Root().PersistentFlags().Changed("format") {
 			jsonOutput = config.GetBool("json")
 		} else {
 			flagOverrides["json"] = struct {
@@ -412,6 +451,26 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
+		// Capture redirect info BEFORE FindDatabasePath() follows the redirect.
+		// When .beads/redirect points to a shared directory with a different
+		// dolt_database, the source's database name would be lost. Capture it
+		// early and set BEADS_DOLT_SERVER_DATABASE so all store opens use it.
+		redirectInfo := beads.GetRedirectInfo()
+		var sourceDoltDatabase string
+		if redirectInfo.IsRedirected && redirectInfo.LocalDir != "" {
+			rInfo := beads.ResolveRedirect(redirectInfo.LocalDir)
+			sourceDoltDatabase = rInfo.SourceDatabase
+		}
+		// Set env var early so ALL store opens (main + routed) use the correct
+		// database. Redirects may resolve to a shared .beads dir that serves
+		// multiple databases; the env var ensures the right one is selected.
+		if sourceDoltDatabase != "" && os.Getenv("BEADS_DOLT_SERVER_DATABASE") == "" {
+			_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", sourceDoltDatabase)
+			if os.Getenv("BD_DEBUG_ROUTING") != "" {
+				fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", sourceDoltDatabase)
+			}
+		}
+
 		// Initialize database path
 		if dbPath == "" {
 			// Use public API to find database (same logic as extensions)
@@ -473,7 +532,7 @@ var rootCmd = &cobra.Command{
 		// opens its own store connection, writes the version metadata, commits it,
 		// and closes BEFORE the main store is opened. This ensures bd doctor and
 		// read-only commands see the correct version after a CLI upgrade.
-		beadsDir := filepath.Dir(dbPath)
+		beadsDir := resolveCommandBeadsDir(dbPath)
 
 		autoMigrateOnVersionBump(beadsDir)
 
@@ -505,15 +564,9 @@ var rootCmd = &cobra.Command{
 		}
 		doltCfg.SyncGitRemote = config.GetString("sync.git-remote")
 
-		// Auto-start: enabled by default.
-		// Can be disabled by explicit config or env var.
-		doltCfg.AutoStart = true
-		if os.Getenv("BEADS_DOLT_AUTO_START") == "0" {
-			doltCfg.AutoStart = false
-		}
-		if v := config.GetString("dolt.auto-start"); v == "false" || v == "0" || v == "off" {
-			doltCfg.AutoStart = false
-		}
+		// Keep standalone CLI auto-start behavior centralized so doctor and
+		// other helper paths stay in lockstep with the main command path.
+		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
 
 		// Server mode defaults auto-commit to OFF because the server handles
 		// commits via its own transaction lifecycle; firing DOLT_COMMIT after
@@ -531,7 +584,7 @@ var rootCmd = &cobra.Command{
 			debug.Logf("cleaned %d stale noms LOCK file(s) from %s", removed, doltPath)
 		}
 
-		store, err = dolt.New(rootCtx, doltCfg)
+		store, err = newDoltStore(rootCtx, doltCfg)
 
 		// Track final read-only state for staleness checks (GH#1089)
 		storeIsReadOnly = doltCfg.ReadOnly
@@ -576,6 +629,13 @@ var rootCmd = &cobra.Command{
 			} else if result.Loaded > 0 {
 				debug.Logf("loaded %d molecules from %v", result.Loaded, result.Sources)
 			}
+		}
+
+		// Check beads refs for git↔Dolt mismatch (bd-vlu.1.7).
+		// Runs after store init, before any command logic. Behavior depends
+		// on branch_strategy.* config settings (silent by default).
+		if store != nil {
+			checkBeadsRefSync(rootCtx, store)
 		}
 
 		// Sync all state to CommandContext for unified access.
@@ -629,6 +689,10 @@ var rootCmd = &cobra.Command{
 		if !isReadOnlyCommand(cmd.Name()) {
 			maybeAutoPush(rootCtx)
 		}
+
+		// Update .beads/HEAD and refs to track current Dolt state.
+		// Runs after all writes/commits so refs reflect the final state.
+		writeBeadsRefs(rootCtx, store)
 
 		// Signal that store is closing (prevents background flush from accessing closed store)
 		storeMutex.Lock()

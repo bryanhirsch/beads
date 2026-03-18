@@ -16,7 +16,7 @@ import (
 
 // CheckInstallation verifies that .beads directory exists
 func CheckInstallation(path string) DoctorCheck {
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(path)
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		// Auto-detect prefix from directory name
 		prefix := filepath.Base(path)
@@ -39,8 +39,7 @@ func CheckInstallation(path string) DoctorCheck {
 
 // CheckPermissions verifies that .beads directory and database are readable/writable
 func CheckPermissions(path string) DoctorCheck {
-	// Follow redirect to resolve actual beads directory (bd-tvus fix)
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Check if .beads/ is writable
 	testFile := filepath.Join(beadsDir, ".doctor-test-write")
@@ -69,7 +68,7 @@ func CheckPermissions(path string) DoctorCheck {
 			}
 			// Try to open Dolt store read-only to verify accessibility
 			ctx := context.Background()
-			store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+			store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 			if err != nil {
 				return DoctorCheck{
 					Name:    "Permissions",

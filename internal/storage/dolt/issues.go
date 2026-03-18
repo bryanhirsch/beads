@@ -12,126 +12,45 @@ import (
 
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// CreateIssue creates a new issue
+// CreateIssue creates a new issue.
+// Delegates SQL work to issueops; handles Dolt versioning for non-ephemeral issues.
 func (s *DoltStore) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
-	// Validate metadata against schema if configured (GH#1416 Phase 2)
-	// Runs before ephemeral routing so wisps are also validated.
-	if err := validateMetadataIfConfigured(issue.Metadata); err != nil {
+	if issue == nil {
+		return fmt.Errorf("issue must not be nil")
+	}
+
+	// Route to wisps table if ephemeral, no-history, or infra type.
+	useWispsTable := issue.Ephemeral || issue.NoHistory || s.IsInfraTypeCtx(ctx, issue.IssueType)
+	if useWispsTable && !issue.NoHistory {
+		issue.Ephemeral = true // infra types get marked ephemeral (legacy behavior)
+	}
+
+	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		// SkipPrefixValidation matches legacy behavior: single-issue path does
+		// not validate prefixes for explicit IDs.
+		bc, err := issueops.NewBatchContext(ctx, tx, storage.BatchCreateOptions{
+			SkipPrefixValidation: true,
+		})
+		if err != nil {
+			return err
+		}
+		return issueops.CreateIssueInTx(ctx, tx, bc, issue, actor)
+	}); err != nil {
 		return err
 	}
 
-	// Route ephemeral issues and infra types to wisps table
-	if issue.Ephemeral || s.IsInfraTypeCtx(ctx, issue.IssueType) {
-		issue.Ephemeral = true
-		return s.createWisp(ctx, issue, actor)
-	}
-
-	// Fetch custom statuses and types for validation
-	customStatuses, err := s.GetCustomStatuses(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom statuses: %w", err)
-	}
-	customTypes, err := s.GetCustomTypes(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom types: %w", err)
-	}
-
-	// Set timestamps (always normalize to UTC since DATETIME columns lose timezone info)
-	now := time.Now().UTC()
-	if issue.CreatedAt.IsZero() {
-		issue.CreatedAt = now
-	} else {
-		issue.CreatedAt = issue.CreatedAt.UTC()
-	}
-	if issue.UpdatedAt.IsZero() {
-		issue.UpdatedAt = now
-	} else {
-		issue.UpdatedAt = issue.UpdatedAt.UTC()
-	}
-
-	// Defensive fix for closed_at invariant
-	if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
-		maxTime := issue.CreatedAt
-		if issue.UpdatedAt.After(maxTime) {
-			maxTime = issue.UpdatedAt
-		}
-		closedAt := maxTime.Add(time.Second)
-		issue.ClosedAt = &closedAt
-	}
-
-	// Validate issue
-	if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
-	}
-
-	// Compute content hash
-	if issue.ContentHash == "" {
-		issue.ContentHash = issue.ComputeContentHash()
-	}
-
-	// Start transaction
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }() // No-op after successful commit
-
-	// Get prefix from config
-	var configPrefix string
-	err = tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", "issue_prefix").Scan(&configPrefix)
-	if err == sql.ErrNoRows || configPrefix == "" {
-		return fmt.Errorf("%w: issue_prefix config is missing (run 'bd init --prefix <prefix>' first)", storage.ErrNotInitialized)
-	} else if err != nil {
-		return fmt.Errorf("failed to get config: %w", err)
-	}
-
-	// Normalize prefix: strip trailing hyphen to prevent double-hyphen IDs (bd-6uly)
-	configPrefix = strings.TrimSuffix(configPrefix, "-")
-
-	// Determine prefix for ID generation
-	prefix := configPrefix
-	if issue.PrefixOverride != "" {
-		prefix = issue.PrefixOverride
-	} else if issue.IDPrefix != "" {
-		prefix = configPrefix + "-" + issue.IDPrefix
-	}
-
-	// Generate or validate ID
-	if issue.ID == "" {
-		generatedID, err := generateIssueID(ctx, tx, prefix, issue, actor)
-		if err != nil {
-			return fmt.Errorf("failed to generate issue ID: %w", err)
-		}
-		issue.ID = generatedID
-	}
-
-	// Insert issue
-	if err := insertIssue(ctx, tx, issue); err != nil {
-		return fmt.Errorf("failed to insert issue: %w", err)
-	}
-
-	// Record creation event
-	if err := recordEvent(ctx, tx, issue.ID, types.EventCreated, actor, "", ""); err != nil {
-		return fmt.Errorf("failed to record creation event: %w", err)
-	}
-
-	// GH#2455: Stage only the tables we modified, then commit without -A
-	// to avoid sweeping up stale config changes from concurrent operations.
-	for _, table := range []string{"issues", "events"} {
-		if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
-			return fmt.Errorf("dolt add %s: %w", table, err)
+	// Dolt versioning — wisps and no-history issues skip DOLT_COMMIT.
+	if !issue.Ephemeral && !issue.NoHistory {
+		if err := s.doltAddAndCommit(ctx, []string{"issues", "events"},
+			fmt.Sprintf("bd: create %s", issue.ID)); err != nil {
+			return err
 		}
 	}
-	commitMsg := fmt.Sprintf("bd: create %s", issue.ID)
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return fmt.Errorf("dolt commit: %w", err)
-	}
-
-	return tx.Commit()
+	return nil
 }
 
 // CreateIssues creates multiple issues in a single transaction
@@ -143,333 +62,54 @@ func (s *DoltStore) CreateIssues(ctx context.Context, issues []*types.Issue, act
 }
 
 // CreateIssuesWithFullOptions creates multiple issues with full options control.
-// This is the backend-agnostic batch creation method that supports orphan handling
-// and prefix validation options.
+// Delegates SQL work to issueops; handles Dolt versioning for non-ephemeral batches.
 func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*types.Issue, actor string, opts storage.BatchCreateOptions) error {
 	if len(issues) == 0 {
 		return nil
 	}
 
-	// Route all-ephemeral batches to wisps table
-	allEph := true
-	for _, issue := range issues {
-		if !issue.Ephemeral {
-			allEph = false
-			break
-		}
-	}
-	if allEph {
+	// All-wisps fast path: individual transactions, no Dolt versioning.
+	// Covers both ephemeral issues and no-history issues (both skip DOLT_COMMIT).
+	if issueops.AllWisps(issues) {
 		for _, issue := range issues {
-			if err := validateMetadataIfConfigured(issue.Metadata); err != nil {
-				return fmt.Errorf("metadata validation failed for issue %s: %w", issue.ID, err)
+			if !issue.NoHistory {
+				issue.Ephemeral = true
 			}
-			if err := s.createWisp(ctx, issue, actor); err != nil {
+			if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+				bc, err := issueops.NewBatchContext(ctx, tx, opts)
+				if err != nil {
+					return err
+				}
+				return issueops.CreateIssueInTx(ctx, tx, bc, issue, actor)
+			}); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	// Fetch custom statuses and types for validation
-	customStatuses, err := s.GetCustomStatuses(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom statuses: %w", err)
-	}
-	customTypes, err := s.GetCustomTypes(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom types: %w", err)
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }() // No-op after successful commit
-
-	// Get prefix from config for validation
-	var configPrefix string
-	err = tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", "issue_prefix").Scan(&configPrefix)
-	if err == sql.ErrNoRows || configPrefix == "" {
-		return fmt.Errorf("%w: issue_prefix config is missing (run 'bd init --prefix <prefix>' first)", storage.ErrNotInitialized)
-	} else if err != nil {
-		return fmt.Errorf("failed to get config: %w", err)
-	}
-
-	// Normalize prefix: strip trailing hyphen to prevent double-hyphen IDs (bd-6uly)
-	configPrefix = strings.TrimSuffix(configPrefix, "-")
-
-	// Get allowed_prefixes for multi-prefix validation (GH#1179)
-	var allowedPrefixes string
-	_ = tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", "allowed_prefixes").Scan(&allowedPrefixes)
-
-	for _, issue := range issues {
-		now := time.Now().UTC()
-		if issue.CreatedAt.IsZero() {
-			issue.CreatedAt = now
-		}
-		if issue.UpdatedAt.IsZero() {
-			issue.UpdatedAt = now
-		}
-
-		// Defensive fix for closed_at invariant
-		if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
-			maxTime := issue.CreatedAt
-			if issue.UpdatedAt.After(maxTime) {
-				maxTime = issue.UpdatedAt
-			}
-			closedAt := maxTime.Add(time.Second)
-			issue.ClosedAt = &closedAt
-		}
-
-		// Validate issue
-		if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
-			return fmt.Errorf("validation failed for issue %s: %w", issue.ID, err)
-		}
-
-		// Validate metadata against schema if configured (GH#1416 Phase 2)
-		if err := validateMetadataIfConfigured(issue.Metadata); err != nil {
-			return fmt.Errorf("metadata validation failed for issue %s: %w", issue.ID, err)
-		}
-
-		if issue.ContentHash == "" {
-			issue.ContentHash = issue.ComputeContentHash()
-		}
-
-		// Validate prefix if not skipped (for imports with different prefixes)
-		if !opts.SkipPrefixValidation && issue.ID != "" {
-			if err := validateIssueIDPrefix(issue.ID, configPrefix, allowedPrefixes); err != nil {
-				return fmt.Errorf("prefix validation failed for %s: %w", issue.ID, err)
-			}
-		}
-
-		// Route ephemeral issues (wisps) to the wisps table, not issues.
-		// Without this, mixed batches (e.g., refinery merges) pollute the
-		// issues table with wisp-pattern rows (Clown Show #21 root cause).
-		isWisp := issue.Ephemeral || IsEphemeralID(issue.ID)
-		issueTable := "issues"
-		eventTable := "events"
-		labelTable := "labels"
-		commentTable := "comments"
-		if isWisp {
-			issueTable = "wisps"
-			eventTable = "wisp_events"
-			labelTable = "wisp_labels"
-			commentTable = "wisp_comments"
-		}
-
-		// Handle orphan checking for hierarchical IDs
-		if issue.ID != "" {
-			if parentID, _, ok := parseHierarchicalID(issue.ID); ok {
-				var parentCount int
-				//nolint:gosec // G201: table is determined by isWisp flag, not user input
-				err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, issueTable), parentID).Scan(&parentCount)
-				if err != nil {
-					return fmt.Errorf("failed to check parent existence: %w", err)
-				}
-				if parentCount == 0 {
-					switch opts.OrphanHandling {
-					case storage.OrphanStrict:
-						return fmt.Errorf("parent issue %s does not exist (strict mode)", parentID)
-					case storage.OrphanSkip:
-						// Skip this issue
-						continue
-					case storage.OrphanResurrect, storage.OrphanAllow:
-						// Allow orphan - continue with insert
-					}
-				}
-			}
-		}
-
-		// Check if issue already exists before inserting (GH#2061).
-		// insertIssue uses ON DUPLICATE KEY UPDATE, so the INSERT always succeeds,
-		// but we need to know whether it was a create or an update to avoid
-		// recording redundant "created" events on re-import.
-		var existingCount int
-		if issue.ID != "" {
-			//nolint:gosec // G201: table is determined by isWisp flag, not user input
-			if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, issueTable), issue.ID).Scan(&existingCount); err != nil {
-				return fmt.Errorf("failed to check issue existence for %s: %w", issue.ID, err)
-			}
-		}
-
-		if err := insertIssueTxIntoTable(ctx, tx, issueTable, issue); err != nil {
-			return fmt.Errorf("failed to insert issue %s into %s: %w", issue.ID, issueTable, err)
-		}
-
-		// Only record "created" event for genuinely new issues (not upserts).
-		if existingCount == 0 {
-			if err := recordEventInTable(ctx, tx, eventTable, issue.ID, types.EventCreated, actor, ""); err != nil {
-				return fmt.Errorf("failed to record event for %s: %w", issue.ID, err)
-			}
-		}
-
-		// Persist labels from the issue struct into the labels table (GH#1844).
-		// Without this, labels from the issue struct are silently dropped on import.
-		for _, label := range issue.Labels {
-			//nolint:gosec // G201: table is determined by isWisp flag, not user input
-			_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-				INSERT INTO %s (issue_id, label)
-				VALUES (?, ?)
-				ON DUPLICATE KEY UPDATE label = label
-			`, labelTable), issue.ID, label)
-			if err != nil {
-				return fmt.Errorf("failed to insert label %q for %s: %w", label, issue.ID, err)
-			}
-		}
-
-		// Persist comments from the issue struct into the comments table (GH#1844).
-		// Use ON DUPLICATE KEY UPDATE to handle re-imports gracefully (GH#2061).
-		for _, comment := range issue.Comments {
-			createdAt := comment.CreatedAt
-			if createdAt.IsZero() {
-				createdAt = time.Now().UTC()
-			}
-			//nolint:gosec // G201: table is determined by isWisp flag, not user input
-			_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-				INSERT INTO %s (issue_id, author, text, created_at)
-				VALUES (?, ?, ?, ?)
-				ON DUPLICATE KEY UPDATE text = VALUES(text)
-			`, commentTable), issue.ID, comment.Author, comment.Text, createdAt)
-			if err != nil {
-				return fmt.Errorf("failed to insert comment for %s: %w", issue.ID, err)
-			}
-		}
-	}
-
-	// Second pass: persist dependencies after all issues exist (GH#1844).
-	// Dependencies reference other issues, so they must be inserted after all
-	// issues are in the table to satisfy foreign-key-like existence checks.
-	for _, issue := range issues {
-		isWisp := issue.Ephemeral || IsEphemeralID(issue.ID)
-		depTable := "dependencies"
-		lookupTable := "issues"
-		if isWisp {
-			depTable = "wisp_dependencies"
-			lookupTable = "wisps"
-		}
-		for _, dep := range issue.Dependencies {
-			// Verify the target issue exists in this batch or already in the DB
-			var exists int
-			//nolint:gosec // G201: table is determined by isWisp flag, not user input
-			err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT 1 FROM %s WHERE id = ?", lookupTable), dep.DependsOnID).Scan(&exists)
-			if err != nil {
-				continue // Target doesn't exist — skip silently
-			}
-
-			//nolint:gosec // G201: table is determined by isWisp flag, not user input
-			_, err = tx.ExecContext(ctx, fmt.Sprintf(`
-				INSERT INTO %s (issue_id, depends_on_id, type, created_by, created_at)
-				VALUES (?, ?, ?, ?, ?)
-				ON DUPLICATE KEY UPDATE type = type
-			`, depTable), dep.IssueID, dep.DependsOnID, dep.Type, actor, dep.CreatedAt)
-			if err != nil {
-				return fmt.Errorf("failed to insert dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
-			}
-		}
-	}
-
-	// Reconcile child_counters for imported hierarchical IDs (GH#2166).
-	// This ensures that subsequent bd create --parent doesn't overwrite
-	// existing children after a JSONL restore.
-	childMaxMap := make(map[string]int)
-	for _, issue := range issues {
-		if parentID, childNum, ok := parseHierarchicalID(issue.ID); ok {
-			if childNum > childMaxMap[parentID] {
-				childMaxMap[parentID] = childNum
-			}
-		}
-	}
-	for parentID, maxChild := range childMaxMap {
-		// FK guard: only upsert counter if parent exists in issues table.
-		// Orphan children (parent not imported) would violate the foreign key
-		// constraint on child_counters.parent_id → issues.id.
-		var parentExists int
-		if err := tx.QueryRowContext(ctx, "SELECT 1 FROM issues WHERE id = ?", parentID).Scan(&parentExists); err != nil {
-			continue // parent not in issues table — skip counter
-		}
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)
-			ON DUPLICATE KEY UPDATE last_child = GREATEST(last_child, ?)
-		`, parentID, maxChild, maxChild)
-		if err != nil {
-			return fmt.Errorf("failed to reconcile child counter for %s: %w", parentID, err)
-		}
+	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return issueops.CreateIssuesInTx(ctx, tx, issues, actor, opts)
+	}); err != nil {
+		return err
 	}
 
 	// GH#2455: Stage only the tables we modified, then commit without -A.
-	for _, table := range []string{"issues", "events", "dependencies", "child_counters"} {
-		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
-	}
-	commitMsg := fmt.Sprintf("bd: create %d issue(s)", len(issues))
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return fmt.Errorf("dolt commit: %w", err)
-	}
-
-	return tx.Commit()
-}
-
-// validateIssueIDPrefix validates that the issue ID matches the configured prefix
-// or any of the allowed_prefixes (GH#1179).
-func validateIssueIDPrefix(id, prefix, allowedPrefixes string) error {
-	if strings.HasPrefix(id, prefix+"-") {
-		return nil
-	}
-	// Check allowed_prefixes (comma-separated)
-	if allowedPrefixes != "" {
-		for _, allowed := range strings.Split(allowedPrefixes, ",") {
-			allowed = strings.TrimSpace(allowed)
-			if allowed != "" && strings.HasPrefix(id, allowed+"-") {
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("%w: issue ID %s does not match configured prefix %s", storage.ErrPrefixMismatch, id, prefix)
-}
-
-// parseHierarchicalID checks if an ID is hierarchical (e.g., "bd-abc.1") and returns the parent ID and child number
-func parseHierarchicalID(id string) (parentID string, childNum int, ok bool) {
-	// Find the last dot that separates parent from child number
-	lastDot := strings.LastIndex(id, ".")
-	if lastDot == -1 {
-		return "", 0, false
-	}
-
-	parentID = id[:lastDot]
-	suffix := id[lastDot+1:]
-
-	// Parse child number
-	var num int
-	_, err := fmt.Sscanf(suffix, "%d", &num)
-	if err != nil {
-		return "", 0, false
-	}
-
-	return parentID, num, true
+	return s.doltAddAndCommit(ctx,
+		[]string{"issues", "events", "labels", "comments", "dependencies", "child_counters"},
+		fmt.Sprintf("bd: create %d issue(s)", len(issues)))
 }
 
 // GetIssue retrieves an issue by ID.
 // Returns storage.ErrNotFound (wrapped) if the issue does not exist.
 func (s *DoltStore) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
-	// Route ephemeral IDs to wisps table (falls through for promoted wisps)
-	if s.isActiveWisp(ctx, id) {
-		return s.getWisp(ctx, id)
-	}
-
-	s.mu.RLock()
-	issue, err := scanIssue(ctx, s.db, id)
-	if err != nil {
-		s.mu.RUnlock()
-		return nil, err
-	}
-	// Fetch labels
-	labels, err := s.GetLabels(ctx, issue.ID)
-	s.mu.RUnlock()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get labels: %w", err)
-	}
-	issue.Labels = labels
-	return issue, nil
+	var issue *types.Issue
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		issue, err = issueops.GetIssueInTx(ctx, tx, id)
+		return err
+	})
+	return issue, err
 }
 
 // GetIssueByExternalRef retrieves an issue by external reference.
@@ -506,6 +146,15 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps)
 	if s.isActiveWisp(ctx, id) {
 		return s.updateWisp(ctx, id, updates, actor)
+	}
+
+	// If updating a regular issue to no-history or ephemeral, migrate it to the
+	// wisps table instead of updating in-place. Table routing only happens at
+	// create time by default, so we must perform the migration here. (be-x4l)
+	_, settingNoHistory := updates["no_history"]
+	_, settingWisp := updates["wisp"]
+	if settingNoHistory || settingWisp {
+		return s.DemoteToWisp(ctx, id, updates, actor)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1179,81 +828,6 @@ func doltBuildSQLInClause(ids []string) (string, []interface{}) {
 // Helper functions
 // =============================================================================
 
-func insertIssue(ctx context.Context, tx *sql.Tx, issue *types.Issue) error {
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO issues (
-			id, content_hash, title, description, design, acceptance_criteria, notes,
-			status, priority, issue_type, assignee, estimated_minutes,
-			created_at, created_by, owner, updated_at, closed_at, external_ref, spec_id,
-			compaction_level, compacted_at, compacted_at_commit, original_size,
-			sender, ephemeral, wisp_type, pinned, is_template, crystallizes,
-			mol_type, work_type, quality_score, source_system, source_repo, close_reason,
-			event_kind, actor, target, payload,
-			await_type, await_id, timeout_ns, waiters,
-			hook_bead, role_bead, agent_state, last_activity, role_type, rig,
-			due_at, defer_until, metadata
-		) VALUES (
-			?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?
-		)
-		ON DUPLICATE KEY UPDATE
-			content_hash = VALUES(content_hash),
-			title = VALUES(title),
-			description = VALUES(description),
-			design = VALUES(design),
-			acceptance_criteria = VALUES(acceptance_criteria),
-			notes = VALUES(notes),
-			status = VALUES(status),
-			priority = VALUES(priority),
-			issue_type = VALUES(issue_type),
-			assignee = VALUES(assignee),
-			estimated_minutes = VALUES(estimated_minutes),
-			updated_at = VALUES(updated_at),
-			closed_at = VALUES(closed_at),
-			external_ref = VALUES(external_ref),
-			source_repo = VALUES(source_repo),
-			close_reason = VALUES(close_reason),
-			metadata = VALUES(metadata)
-	`,
-		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
-		issue.Status, issue.Priority, issue.IssueType, nullString(issue.Assignee), nullInt(issue.EstimatedMinutes),
-		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.ClosedAt, nullStringPtr(issue.ExternalRef), issue.SpecID,
-		issue.CompactionLevel, issue.CompactedAt, nullStringPtr(issue.CompactedAtCommit), nullIntVal(issue.OriginalSize),
-		issue.Sender, issue.Ephemeral, issue.WispType, issue.Pinned, issue.IsTemplate, issue.Crystallizes,
-		issue.MolType, issue.WorkType, issue.QualityScore, issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
-		issue.EventKind, issue.Actor, issue.Target, issue.Payload,
-		issue.AwaitType, issue.AwaitID, issue.Timeout.Nanoseconds(), formatJSONStringArray(issue.Waiters),
-		issue.HookBead, issue.RoleBead, issue.AgentState, issue.LastActivity, issue.RoleType, issue.Rig,
-		issue.DueAt, issue.DeferUntil, jsonMetadata(issue.Metadata),
-	)
-	return wrapExecError("insert issue", err)
-}
-
-func scanIssue(ctx context.Context, db *sql.DB, id string) (*types.Issue, error) {
-	row := db.QueryRowContext(ctx, `
-		SELECT `+issueSelectColumns+`
-		FROM issues
-		WHERE id = ?
-	`, id)
-
-	issue, err := scanIssueFrom(row)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("%w: issue %s", storage.ErrNotFound, id)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get issue: %w", err)
-	}
-	return issue, nil
-}
-
 func recordEvent(ctx context.Context, tx *sql.Tx, issueID string, eventType types.EventType, actor, oldValue, newValue string) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO events (issue_id, event_type, actor, old_value, new_value)
@@ -1388,53 +962,6 @@ func isCounterModeTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	return idMode == "counter", nil
 }
 
-// generateIssueID generates a unique ID for an issue.
-// If issue_id_mode=counter is configured, generates sequential IDs (bd-1, bd-2, ...).
-// Otherwise uses the default hash-based ID generation.
-func generateIssueID(ctx context.Context, tx *sql.Tx, prefix string, issue *types.Issue, actor string) (string, error) {
-	counterMode, err := isCounterModeTx(ctx, tx)
-	if err != nil {
-		return "", err
-	}
-	if counterMode {
-		return nextCounterIDTx(ctx, tx, prefix)
-	}
-
-	// Default hash-based ID generation
-	// Get adaptive base length based on current database size
-	baseLength, err := GetAdaptiveIDLengthTx(ctx, tx, prefix)
-	if err != nil {
-		// Fallback to 6 on error
-		baseLength = 6
-	}
-
-	// Try baseLength, baseLength+1, baseLength+2, up to max of 8
-	maxLength := 8
-	if baseLength > maxLength {
-		baseLength = maxLength
-	}
-
-	for length := baseLength; length <= maxLength; length++ {
-		// Try up to 10 nonces at each length
-		for nonce := 0; nonce < 10; nonce++ {
-			candidate := generateHashID(prefix, issue.Title, issue.Description, actor, issue.CreatedAt, length, nonce)
-
-			// Check if this ID already exists
-			var count int
-			err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM issues WHERE id = ?`, candidate).Scan(&count)
-			if err != nil {
-				return "", fmt.Errorf("failed to check for ID collision: %w", err)
-			}
-
-			if count == 0 {
-				return candidate, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("failed to generate unique ID after trying lengths %d-%d with 10 nonces each", baseLength, maxLength)
-}
-
 // generateHashID creates a hash-based ID for a top-level issue.
 // Uses base36 encoding (0-9, a-z) for better information density than hex.
 func generateHashID(prefix, title, description, creator string, timestamp time.Time, length, nonce int) string {
@@ -1448,7 +975,7 @@ func isAllowedUpdateField(key string) bool {
 		"issue_type": true, "estimated_minutes": true, "external_ref": true, "spec_id": true,
 		"closed_at": true, "close_reason": true, "closed_by_session": true,
 		"source_repo": true,
-		"sender":      true, "wisp": true, "wisp_type": true, "pinned": true,
+		"sender":      true, "wisp": true, "wisp_type": true, "no_history": true, "pinned": true,
 		"hook_bead": true, "role_bead": true, "agent_state": true, "last_activity": true,
 		"role_type": true, "rig": true, "mol_type": true, "holder": true,
 		"event_category": true, "event_actor": true, "event_target": true, "event_payload": true,
@@ -1507,61 +1034,20 @@ func determineEventType(oldIssue *types.Issue, updates map[string]interface{}) t
 	return types.EventStatusChanged
 }
 
-// Helper functions for nullable values
-func nullString(s string) interface{} {
-	if s == "" {
-		return nil
-	}
-	return s
-}
+// Aliases for shared nullable helpers from issueops.
+var (
+	nullString    = issueops.NullString
+	nullStringPtr = issueops.NullStringPtr
+	nullInt       = issueops.NullInt
+	nullIntVal    = issueops.NullIntVal
+)
 
-func nullStringPtr(s *string) interface{} {
-	if s == nil {
-		return nil
-	}
-	return *s
-}
-
-func nullInt(i *int) interface{} {
-	if i == nil {
-		return nil
-	}
-	return *i
-}
-
-func nullIntVal(i int) interface{} {
-	if i == 0 {
-		return nil
-	}
-	return i
-}
-
-// jsonMetadata returns the metadata as a validated JSON string, or "{}" if empty.
-// Dolt's JSON column type requires valid JSON, so we normalize nil/empty to "{}"
-// and validate that non-empty metadata is well-formed JSON.
-func jsonMetadata(m []byte) string {
-	if len(m) == 0 {
-		return "{}"
-	}
-	s := string(m)
-	if !json.Valid(m) {
-		// Fall back to empty object for invalid JSON rather than storing garbage
-		_, _ = fmt.Fprintf(os.Stderr, "Warning: invalid JSON metadata, using empty object\n")
-		return "{}"
-	}
-	return s
-}
-
-func parseJSONStringArray(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var result []string
-	if err := json.Unmarshal([]byte(s), &result); err != nil {
-		return nil
-	}
-	return result
-}
+// Aliases for shared helpers from issueops.
+var (
+	jsonMetadata          = issueops.JSONMetadata
+	parseJSONStringArray  = issueops.ParseJSONStringArray
+	formatJSONStringArray = issueops.FormatJSONStringArray
+)
 
 // DeleteIssuesBySourceRepo permanently removes all issues from a specific source repository.
 // This is used when a repo is removed from the multi-repo configuration.
@@ -1692,15 +1178,4 @@ func (s *DoltStore) SetRepoMtime(ctx context.Context, repoPath, jsonlPath string
 			last_checked = NOW()
 	`, repoPath, jsonlPath, mtimeNs)
 	return wrapExecError("set repo mtime", err)
-}
-
-func formatJSONStringArray(arr []string) string {
-	if len(arr) == 0 {
-		return ""
-	}
-	data, err := json.Marshal(arr)
-	if err != nil {
-		return ""
-	}
-	return string(data)
 }

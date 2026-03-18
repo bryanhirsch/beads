@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/hooks"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -64,6 +64,8 @@ create, update, show, or close operation).`,
 		continueFlag, _ := cmd.Flags().GetBool("continue")
 		noAuto, _ := cmd.Flags().GetBool("no-auto")
 		suggestNext, _ := cmd.Flags().GetBool("suggest-next")
+
+		claimNext, _ := cmd.Flags().GetBool("claim-next")
 
 		// Get session ID from flag or environment variable
 		session, _ := cmd.Flags().GetString("session")
@@ -277,8 +279,44 @@ create, update, show, or close operation).`,
 			}
 		}
 
+		// Handle --claim-next flag
+		var claimedNextIssue *types.Issue
+		if claimNext && closedCount > 0 && !continueFlag {
+			readyIssues, err := store.GetReadyWork(ctx, types.WorkFilter{
+				Status:     "open",
+				Limit:      1,
+				SortPolicy: types.SortPolicy("priority"),
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not get ready issues: %v\n", err)
+			} else if len(readyIssues) > 0 {
+				nextIssue := readyIssues[0]
+				err := store.ClaimIssue(ctx, nextIssue.ID, actor)
+				if err == nil {
+					claimedNextIssue = nextIssue
+					if jsonOutput {
+						// JSON handled below
+					} else {
+						fmt.Printf("%s Auto-claimed next ready issue: %s (P%d)\n", ui.RenderPass("✓"), formatFeedbackID(nextIssue.ID, nextIssue.Title), nextIssue.Priority)
+					}
+					SetLastTouchedID(nextIssue.ID)
+				} else {
+					fmt.Fprintf(os.Stderr, "Warning: could not claim next issue %s: %v\n", nextIssue.ID, err)
+				}
+			} else if !jsonOutput {
+				fmt.Printf("\n%s No ready issues available to claim.\n", ui.RenderWarn("✨"))
+			}
+		}
+
 		if jsonOutput && len(closedIssues) > 0 {
-			outputJSON(closedIssues)
+			if claimedNextIssue != nil {
+				outputJSON(map[string]interface{}{
+					"closed":  closedIssues,
+					"claimed": claimedNextIssue,
+				})
+			} else {
+				outputJSON(closedIssues)
+			}
 		}
 
 		// Exit non-zero if no issues were actually closed (close guard
@@ -302,6 +340,7 @@ func init() {
 	closeCmd.Flags().Bool("continue", false, "Auto-advance to next step in molecule")
 	closeCmd.Flags().Bool("no-auto", false, "With --continue, show next step but don't claim it")
 	closeCmd.Flags().Bool("suggest-next", false, "Show newly unblocked issues after closing")
+	closeCmd.Flags().Bool("claim-next", false, "Automatically claim the next highest priority available issue")
 	closeCmd.Flags().String("session", "", "Claude Code session ID (or set CLAUDE_SESSION_ID env var)")
 	closeCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(closeCmd)
@@ -373,7 +412,7 @@ func checkGateSatisfaction(issue *types.Issue) error {
 // autoCloseCompletedMolecule checks if closing a step completed a parent molecule,
 // and if so, auto-closes the molecule root. This prevents stale wisps that are
 // complete but never explicitly closed (e.g., deacon patrol wisps).
-func autoCloseCompletedMolecule(ctx context.Context, s *dolt.DoltStore, closedStepID, actorName, session string) {
+func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, closedStepID, actorName, session string) {
 	moleculeID := findParentMolecule(ctx, s, closedStepID)
 	if moleculeID == "" {
 		return // Not part of a molecule

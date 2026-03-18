@@ -7,17 +7,19 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
 // transact wraps store.RunInTransaction and marks that a transactional
 // DOLT_COMMIT occurred, preventing the redundant maybeAutoCommit in
 // PersistentPostRun. Use this instead of calling store.RunInTransaction
 // directly from command handlers.
-func transact(ctx context.Context, s *dolt.DoltStore, commitMsg string, fn func(tx storage.Transaction) error) error {
+func transact(ctx context.Context, s storage.DoltStorage, commitMsg string, fn func(tx storage.Transaction) error) error {
 	err := s.RunInTransaction(ctx, commitMsg, fn)
 	if err == nil {
 		commandDidExplicitDoltCommit = true
+		// Write .beads/HEAD and refs after successful transaction commit
+		writeBeadsRefs(ctx, s)
 	}
 	return err
 }
@@ -51,7 +53,10 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 	}
 
 	st := getStore()
-	if st == nil || st.IsClosed() {
+	if st == nil {
+		return nil
+	}
+	if lm, ok := st.(storage.LifecycleManager); ok && lm.IsClosed() {
 		return nil
 	}
 
@@ -66,23 +71,15 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 		}
 		return err
 	}
+
+	// Write .beads/HEAD and refs after successful commit
+	writeBeadsRefs(ctx, st)
+
 	return nil
 }
 
 func isDoltNothingToCommit(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	// Dolt commonly reports "nothing to commit".
-	if strings.Contains(s, "nothing to commit") {
-		return true
-	}
-	// Some versions/paths may report "no changes".
-	if strings.Contains(s, "no changes") && strings.Contains(s, "commit") {
-		return true
-	}
-	return false
+	return issueops.IsNothingToCommitError(err)
 }
 
 func formatDoltAutoCommitMessage(cmd string, actor string, issueIDs []string) string {

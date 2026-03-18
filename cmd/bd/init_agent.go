@@ -25,6 +25,8 @@ func addAgentsInstructions(verbose bool, templatePath string) {
 }
 
 // updateAgentFile creates or updates an agent instructions file with embedded template content.
+// When a beads section already exists (legacy or current), it is updated to the latest
+// versioned format so that `bd init` never silently locks in stale sections.
 func updateAgentFile(filename string, verbose bool, templatePath string) error {
 	// Check if file exists
 	//nolint:gosec // G304: filename comes from hardcoded list in addAgentsInstructions
@@ -41,6 +43,14 @@ func updateAgentFile(filename string, verbose bool, templatePath string) error {
 			newContent = string(data)
 		} else {
 			newContent = agents.EmbeddedDefault()
+		}
+
+		// Ensure the beads section uses versioned markers even in new files.
+		// EmbeddedDefault() may contain legacy markers; upgrade them.
+		if strings.Contains(newContent, "BEGIN BEADS INTEGRATION") && !strings.Contains(newContent, "profile:") {
+			if replaced, changed, err := agents.ReplaceSection(newContent, agents.ProfileFull); err == nil && changed {
+				newContent = replaced
+			}
 		}
 
 		// #nosec G306 - markdown needs to be readable
@@ -60,19 +70,32 @@ func updateAgentFile(filename string, verbose bool, templatePath string) error {
 	hasBeads := strings.Contains(contentStr, "BEGIN BEADS INTEGRATION")
 
 	if hasBeads {
-		if verbose {
-			fmt.Printf("  %s already has agent instructions\n", filename)
+		// Update existing section to latest versioned format (upgrades legacy markers)
+		updated, changed, replaceErr := agents.ReplaceSection(contentStr, agents.ProfileFull)
+		if replaceErr != nil {
+			return fmt.Errorf("failed to update beads section in %s: %w", filename, replaceErr)
+		}
+		if changed {
+			// #nosec G306 - markdown needs to be readable
+			if err := os.WriteFile(filename, []byte(updated), 0644); err != nil {
+				return fmt.Errorf("failed to update %s: %w", filename, err)
+			}
+			if verbose {
+				fmt.Printf("  %s Updated beads section in %s to latest format\n", ui.RenderPass("✓"), filename)
+			}
+		} else if verbose {
+			fmt.Printf("  %s already has current agent instructions\n", filename)
 		}
 		return nil
 	}
 
-	// Append beads section (includes landing-the-plane)
+	// Append beads section with profile metadata (includes landing-the-plane)
 	newContent := contentStr
 	if !strings.HasSuffix(newContent, "\n") {
 		newContent += "\n"
 	}
 
-	newContent += "\n" + agents.EmbeddedBeadsSection()
+	newContent += "\n" + agents.RenderSection(agents.ProfileFull)
 
 	// #nosec G306 - markdown needs to be readable
 	if err := os.WriteFile(filename, []byte(newContent), 0644); err != nil {
